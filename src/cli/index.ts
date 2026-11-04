@@ -1,13 +1,18 @@
 #!/usr/bin/env node
 import { defineCommand, runMain } from "citty";
 import { version as fastnodeVersion } from "#fastnode/meta";
-import { showUsage } from "./_usage.ts";
+import { intro, outro } from "./ui.ts";
+
+const pkgName = "fastnode";
+const pkgVersion = fastnodeVersion ?? "1.0.0";
+
+intro(`${pkgName} v${pkgVersion}`);
 
 const main = defineCommand({
   meta: {
-    name: "fastnode",
-    description: "Fastnode CLI",
-    version: fastnodeVersion,
+    name: pkgName,
+    description: "Build and Deploy Universal JavaScript Servers",
+    version: pkgVersion,
   },
   subCommands: {
     create: () => import("./commands/create/index.ts").then((r) => r.default),
@@ -24,4 +29,6 @@ const main = defineCommand({
   },
 });
 
-runMain(main, { showUsage });
+runMain(main).finally(() => {
+  outro(`Happy coding with ${pkgName}!`);
+});

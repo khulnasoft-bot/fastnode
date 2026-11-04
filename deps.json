@@ -1,5 +1,6 @@
 {
   "deps": {
+    "@clack/prompts": { "version": "^1", "reason": "CLI user interface" },
     "rolldown": { "version": "^1", "reason": "the `rolldown` builder", "types": true },
     "rollup": { "version": "^4", "reason": "the `rollup` builder", "types": true },
     "vite": { "version": "^8", "reason": "the `vite` builder" },

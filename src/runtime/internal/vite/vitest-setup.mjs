@@ -8,17 +8,5 @@ beforeAll(async () => {
   if (Object.hasOwn(registry, "default")) {
     return;
   }
-  Object.defineProperty(registry, "default", {
-    configurable: true,
-    enumerable: true,
-    get: () => useFastnodeApp(),
-    set: (value) => {
-      Object.defineProperty(registry, "default", {
-        value,
-        configurable: true,
-        enumerable: true,
-        writable: true,
-      });
-    },
-  });
+  useFastnodeApp();
 });

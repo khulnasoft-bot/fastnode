@@ -17,12 +17,12 @@ export function h3FindRoute(h3: H3Core, event: H3Event): MatchedRoute | undefine
 }
 
 /** Push middleware onto h3's `~middleware` chain. */
-export function h3PushMiddleware(h3: H3Core, middleware: Middleware[]) {
+export function h3PushMiddleware(h3: H3Core, middleware: Middleware[]): void {
   h3["~middleware"].push(...middleware);
 }
 
 /** Reset h3's composed dispatcher so plugins can re-compose the chain. */
-export function h3ResetDispatcher(h3: H3Core) {
+export function h3ResetDispatcher(h3: H3Core): void {
   h3["~dispatch"] = h3["~composed"] = undefined;
 }
 
@@ -48,6 +48,6 @@ export function captureFastnodeError(
   req: ServerRequest,
   error: unknown,
   errorCtx: { event?: HTTPEvent }
-) {
+): void {
   ensureFastnodeErrors(req).push({ error, context: errorCtx });
 }

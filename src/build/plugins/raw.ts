@@ -1,0 +1,160 @@
+import { readFileSync } from "node:fs";
+import { isAbsolute } from "pathe";
+import mime from "mime";
+import type { Plugin } from "rollup";
+import { chain } from "../../utils/sync.ts";
+
+const HELPER_ID = "virtual:fastnode-raw-helpers";
+
+// `raw:` infers the module type from the file mime, `bytes:` always yields a
+// Uint8Array and `text:` always a string (import attributes ignore the file type)
+const TYPES = ["raw", "bytes", "text"] as const;
+
+const PREFIX_RE = new RegExp(`^(${TYPES.join("|")}):`);
+
+// Modules under this prefix hold file contents, not source code, so other transforms must skip them.
+// The `\0` keeps vite dev from checking file access on them (denied for ids with `:`, e.g. `.svg`).
+export const RESOLVED_PREFIX = "\0virtual:fastnode:";
+export const RESOLVED_RE = new RegExp(`^${RESOLVED_PREFIX}(${TYPES.join("|")}):`);
+
+// Resolved ids are JavaScript modules. Without this, plugins matching the original
+// extension (`@rollup/plugin-json`, vite's json plugin, ...) try to transform them again.
+const RESOLVED_SUFFIX = ".js";
+
+export function raw(): Plugin {
+  return {
+    name: "fastnode:raw",
+    resolveId: {
+      order: "pre",
+      filter: {
+        // One pattern per prefix, so runtimes routing `scheme:` specifiers by scheme see them
+        id: [new RegExp(`^${HELPER_ID}$`), ...TYPES.map((type) => new RegExp(`^${type}:`))],
+      },
+      handler(id, importer, resolveOpts) {
+        if (id === HELPER_ID) {
+          return id;
+        }
+        const type = PREFIX_RE.exec(id)?.[1];
+        if (!type) {
+          return;
+        }
+        const specifier = id.slice(type.length + 1);
+        return chain(this.resolve(specifier, importer, resolveOpts), (resolved) => {
+          // Externals are not loadable and a query is not part of a file path, so
+          // neither has contents to inline (virtual modules are handled in `load`)
+          if (!resolved?.id || resolved.external || resolved.id.includes("?")) {
+            return this.error(
+              `Could not resolve \`${specifier}\`${importer ? ` (imported by \`${importer}\`)` : ""} to contents to inline as \`${type}\`.`
+            );
+          }
+          return { id: `${RESOLVED_PREFIX}${type}:${resolved.id}${RESOLVED_SUFFIX}` };
+        });
+      },
+    },
+    load: {
+      order: "pre",
+      filter: {
+        id: [new RegExp(`^${HELPER_ID}$`), RESOLVED_RE],
+      },
+      handler(id) {
+        if (id === HELPER_ID) {
+          return getHelpers();
+        }
+        const parsed = parseRawId(id);
+        if (!parsed) {
+          return; // In case the builder does not support filters
+        }
+        const { path, binary } = parsed;
+        // Virtual modules (`fastnode.vfs`, other plugins) have no file to read: inline
+        // their rendered source instead. `transform` decodes as latin1, so re-encode.
+        if (!isAbsolute(path)) {
+          return this.load({ id: path }).then(({ code }) => {
+            if (code == null) {
+              return this.error(`Could not load \`${path}\` to inline its contents.`);
+            }
+            return binary ? Buffer.from(code, "utf8").toString("binary") : code;
+          });
+        }
+        this.addWatchFile(path);
+        return readFileSync(path, binary ? "binary" : "utf8");
+      },
+    },
+    transform: {
+      order: "pre",
+      filter: {
+        id: RESOLVED_RE,
+      },
+      handler(code, id) {
+        const parsed = parseRawId(id);
+        if (!parsed) {
+          return; // In case the builder does not support filters
+        }
+        const { path, binary } = parsed;
+        if (binary) {
+          const serialized = Buffer.from(code, "binary").toString("base64");
+          return {
+            code: `import {base64ToUint8Array } from "${HELPER_ID}" \n export default base64ToUint8Array("${serialized}")`,
+            map: rawAssetMap(path),
+            moduleType: "js",
+          };
+        }
+        return {
+          code: `export default ${JSON.stringify(code)}`,
+          map: rawAssetMap(path),
+          moduleType: "js",
+        };
+      },
+    },
+  };
+}
+
+function parseRawId(id: string) {
+  const match = RESOLVED_RE.exec(id);
+  if (!match) {
+    return;
+  }
+  const [, type] = match;
+  const path = id.replace(RESOLVED_RE, "").slice(0, -RESOLVED_SUFFIX.length);
+  return {
+    path,
+    // `raw:` infers from the file mime, but virtual modules are source code and
+    // usually have no extension to infer from
+    binary: type === "bytes" || (type === "raw" && isAbsolute(path) && isBinary(path)),
+  };
+}
+
+function isBinary(id: string) {
+  const idMime = mime.getType(id) || "";
+  if (idMime.startsWith("text/")) {
+    return false;
+  }
+  if (/application\/(json|sql|xml|yaml)/.test(idMime)) {
+    return false;
+  }
+  return true;
+}
+
+function getHelpers() {
+  return /* js */ `
+export function base64ToUint8Array(str) {
+  const data = atob(str);
+  const size = data.length;
+  const bytes = new Uint8Array(size);
+  for (let i = 0; i < size; i++) {
+    bytes[i] = data.charCodeAt(i);
+  }
+  return bytes;
+}
+  `;
+}
+
+function rawAssetMap(id: string) {
+  return {
+    version: 3,
+    file: id,
+    sources: [id],
+    sourcesContent: [],
+    names: [],
+    mappings: "",
+  };
+}

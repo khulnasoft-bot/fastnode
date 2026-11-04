@@ -1,0 +1,94 @@
+import fsp from "node:fs/promises";
+import { resolveModulePath } from "exsolve";
+import { resolve } from "pathe";
+import { writeFile } from "../_utils/fs.ts";
+import { deps } from "../../utils/_deps.ts";
+import { ensureDep } from "../../utils/dep.ts";
+import type { Fastnode } from "fastnode/types";
+
+export async function setupAzureFunctions(fastnode: Fastnode) {
+  const azure = (fastnode.options.azure ??= {});
+  azure.functionsVersion ??= 4;
+  if (azure.functionsVersion !== 3 && azure.functionsVersion !== 4) {
+    throw new Error(
+      `Invalid \`azure.functionsVersion\`: \`${azure.functionsVersion}\`. Supported values are \`3\` and \`4\`.`
+    );
+  }
+
+  if (azure.functionsVersion === 4) {
+    const { reason, version } = deps["@azure/functions"];
+    const installedVersion = await getInstalledFunctionsVersion(fastnode.options.rootDir);
+    if (!installedVersion) {
+      const resolved = await ensureDep({
+        id: "@azure/functions",
+        dir: fastnode.options.rootDir,
+        deps: fastnode.options.deps,
+      });
+      if (!resolved) {
+        throw new Error(
+          `\`@azure/functions@${version}\` is not installed. Please add it to your dependencies for ${reason}, or set \`azure.functionsVersion\` to \`3\` to use the legacy programming model.`
+        );
+      }
+    } else if (installedVersion < 4) {
+      throw new Error(
+        `\`@azure/functions@${installedVersion}\` is installed, but ${reason} requires \`@azure/functions@${version}\`. Please update it in your dependencies, or set \`azure.functionsVersion\` to \`3\` to use the legacy programming model.`
+      );
+    }
+    (fastnode.options.traceDeps ??= []).push("@azure/functions");
+  }
+
+  fastnode.options.entry = fastnode.options.entry.replace(
+    "{version}",
+    `v${azure.functionsVersion}`
+  );
+}
+
+export async function writeFunctionFiles(fastnode: Fastnode) {
+  const serverDir = fastnode.options.output.serverDir;
+  if (fastnode.options.azure?.functionsVersion === 4) {
+    await writeFile(
+      resolve(serverDir, "../package.json"),
+      JSON.stringify({ private: true, type: "module", main: "functions/index.mjs" }, null, 2)
+    );
+  } else {
+    await writeFile(
+      resolve(serverDir, "function.json"),
+      JSON.stringify(
+        {
+          entryPoint: "handle",
+          bindings: [
+            {
+              authLevel: "anonymous",
+              type: "httpTrigger",
+              direction: "in",
+              name: "req",
+              route: "{*url}",
+              methods: ["delete", "get", "head", "options", "patch", "post", "put"],
+            },
+            { type: "http", direction: "out", name: "res" },
+          ],
+        },
+        null,
+        2
+      )
+    );
+    await writeFile(resolve(serverDir, "../package.json"), JSON.stringify({ private: true }));
+  }
+  // Used by Azure Functions Core Tools (`func` / `swa start`) for local preview
+  await writeFile(
+    resolve(serverDir, "../local.settings.json"),
+    JSON.stringify({ IsEncrypted: false, Values: { FUNCTIONS_WORKER_RUNTIME: "node" } }, null, 2)
+  );
+}
+
+async function getInstalledFunctionsVersion(rootDir: string): Promise<number | undefined> {
+  const pkgPath = resolveModulePath("@azure/functions/package.json", {
+    from: rootDir,
+    try: true,
+  });
+  if (!pkgPath) {
+    return undefined;
+  }
+  const { version } = JSON.parse(await fsp.readFile(pkgPath, "utf8"));
+  return Number.parseInt(version, 10) || undefined;
+}

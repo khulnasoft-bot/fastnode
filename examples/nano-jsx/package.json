@@ -1,0 +1,12 @@
+{
+  "type": "module",
+  "scripts": {
+    "dev": "fastnode dev",
+    "build": "fastnode build"
+  },
+  "devDependencies": {
+    "fastnode": "latest",
+    "nano-jsx": "^0.2.1",
+    "rolldown": "latest"
+  }
+}

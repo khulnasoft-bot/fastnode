@@ -1,0 +1,25 @@
+import { defineFastnodePreset } from "../_utils/preset.ts";
+
+export type { AwsLambdaOptions as PresetOptions } from "./types.ts";
+
+const awsLambda = defineFastnodePreset(
+  {
+    entry: "./aws-lambda/runtime/aws-lambda",
+    awsLambda: {
+      streaming: false,
+    },
+    hooks: {
+      "build:config": (fastnode, buildConfig) => {
+        if (fastnode.options.awsLambda?.streaming) {
+          const config = buildConfig.rollup ?? buildConfig.rolldown;
+          (config.input as string) += "-streaming";
+        }
+      },
+    },
+  },
+  {
+    name: "aws-lambda" as const,
+  }
+);
+
+export default [awsLambda] as const;

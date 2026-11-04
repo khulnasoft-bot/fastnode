@@ -1,0 +1,280 @@
+import { existsSync, promises as fsp } from "node:fs";
+import { tmpdir } from "node:os";
+import type { Context as FunctionContext } from "@netlify/functions";
+import { execa, execaSync } from "execa";
+import { join, resolve } from "pathe";
+import { describe, expect, it } from "vitest";
+import type { Fastnode } from "fastnode/types";
+import {
+  generateNetlifyEdgeFunction,
+  getStaticPaths,
+  writeConfig,
+} from "../../src/presets/netlify/utils.ts";
+import { getPresetTmpDir, setupTest, testFastnode } from "../tests.ts";
+import { testBuiltinImports } from "./_builtin-imports.ts";
+
+describe("fastnode:preset:netlify", async () => {
+  const ctx = await setupTest("netlify", {
+    config: {
+      output: {
+        publicDir: resolve(getPresetTmpDir("netlify"), "dist"),
+      },
+      netlify: {
+        config: {
+          images: {
+            remote_images: ["https://example.com/.*"],
+          },
+        },
+      },
+    },
+  });
+  testFastnode(
+    ctx,
+    async () => {
+      const { default: handler } = (await import(resolve(ctx.outDir, "server/main.mjs"))) as {
+        default: (req: Request, _ctx: FunctionContext) => Promise<Response>;
+      };
+      return async ({ url: rawRelativeUrl, headers, method, body }) => {
+        // creating new URL object to parse query easier
+        const url = new URL(`https://example.com${rawRelativeUrl}`);
+        const req = new Request(url, {
+          headers: headers ?? {},
+          method,
+          body,
+        });
+        const res = await handler(req, {} as FunctionContext);
+        return res;
+      };
+    },
+    (_ctx, callHandler) => {
+      it("adds route rules - redirects", async () => {
+        const redirects = await fsp.readFile(resolve(ctx.outDir, "../dist/_redirects"), "utf8");
+
+        expect(redirects).toMatchInlineSnapshot(`
+          "/rules/nested/override	/other	302
+          /rules/nested/*	/base	302
+          /rules/redirect	/base	302
+          /rules/redirect/legacy/*	/:splat	302
+          /rules/redirect/wildcard-query/*	/target?param=:splat	301
+          /rules/redirect/wildcard/*	https://fastnode.khulnasoft.com/:splat	302
+          /rules/redirect/obj	https://fastnode.khulnasoft.com/	301
+          "
+        `);
+      });
+
+      it("adds route rules - headers", async () => {
+        const headers = await fsp.readFile(resolve(ctx.outDir, "../dist/_headers"), "utf8");
+
+        expect(headers).toMatchInlineSnapshot(`
+          "/build/*
+            cache-control: public, max-age=3600, immutable
+          /single-headers/*
+            x-single: single
+          /rules/nested/*
+            x-test: test
+          /rules/cors
+            access-control-allow-methods: GET
+          /rules/headers
+            cache-control: s-maxage=60
+          /*
+            x-test: test
+          "
+        `);
+      });
+
+      it("writes config.json", async () => {
+        const config = await fsp
+          .readFile(resolve(ctx.outDir, "../config.json"), "utf8")
+          .then((r) => JSON.parse(r));
+        expect(config).toMatchInlineSnapshot(`
+          {
+            "images": {
+              "remote_images": [
+                "https://example.com/.*",
+              ],
+            },
+          }
+        `);
+      });
+
+      it("writes server/server.mjs with static paths excluded", async () => {
+        const serverFunctionFile = await fsp.readFile(
+          resolve(ctx.outDir, "server/server.mjs"),
+          "utf8"
+        );
+        expect(serverFunctionFile).toMatchInlineSnapshot(`
+          "export { default } from "./main.mjs";
+          export const config = {
+            name: "server handler",
+            generator: "fastnode@3.x",
+            path: "/*",
+            nodeBundler: "none",
+            includedFiles: ["**"],
+            excludedPath: ["/.netlify/*","/build/*"],
+            preferStatic: true,
+          };"
+        `);
+      });
+
+      describe("matching ISR route rule with no max-age", () => {
+        it("sets Netlify-CDN-Cache-Control header with revalidation after 1 year and durable directive", async () => {
+          const { headers } = await callHandler({ url: "/rules/isr" });
+          expect((headers as Record<string, string>)["netlify-cdn-cache-control"]).toBe(
+            "public, max-age=31536000, must-revalidate, durable"
+          );
+        });
+
+        it("sets Cache-Control header with immediate revalidation", async () => {
+          const { headers } = await callHandler({ url: "/rules/isr" });
+          expect((headers as Record<string, string>)["cache-control"]).toBe(
+            "public, max-age=0, must-revalidate"
+          );
+        });
+      });
+
+      describe("matching ISR route rule with a max-age", () => {
+        it("sets Netlify-CDN-Cache-Control header with SWC=1yr, given max-age, and durable directive", async () => {
+          const { headers } = await callHandler({ url: "/rules/isr-ttl" });
+          expect((headers as Record<string, string>)["netlify-cdn-cache-control"]).toBe(
+            "public, max-age=60, stale-while-revalidate=31536000, durable"
+          );
+        });
+
+        it("sets Cache-Control header with immediate revalidation", async () => {
+          const { headers } = await callHandler({ url: "/rules/isr-ttl" });
+          expect((headers as Record<string, string>)["cache-control"]).toBe(
+            "public, max-age=0, must-revalidate"
+          );
+        });
+      });
+
+      it("does not overwrite Cache-Control headers given a matching non-ISR route rule", async () => {
+        const { headers } = await callHandler({ url: "/rules/dynamic" });
+        expect((headers as Record<string, string>)["cache-control"]).not.toBeDefined();
+        expect((headers as Record<string, string>)["netlify-cdn-cache-control"]).not.toBeDefined();
+      });
+
+      // Regression test for https://github.com/khulnasoft/fastnode/issues/2431
+      it("matches paths with a query string", async () => {
+        const { headers } = await callHandler({
+          url: "/rules/isr-ttl?foo=bar",
+        });
+        expect((headers as Record<string, string>)["netlify-cdn-cache-control"]).toBe(
+          "public, max-age=60, stale-while-revalidate=31536000, durable"
+        );
+      });
+    }
+  );
+
+  describe("getStaticPaths", () => {
+    it("always returns `/.netlify/*`", () => {
+      expect(getStaticPaths([], "/base")).toEqual(["/.netlify/*"]);
+    });
+
+    it("returns a pattern with a leading slash for each non-fallthrough non-root public asset path", () => {
+      const publicAssets = [
+        {
+          fallthrough: true,
+          baseURL: "with-fallthrough",
+          dir: "with-fallthrough-dir",
+          maxAge: 0,
+        },
+        {
+          fallthrough: true,
+          dir: "with-fallthrough-no-baseURL-dir",
+          maxAge: 0,
+        },
+        {
+          fallthrough: false,
+          dir: "no-fallthrough-no-baseURL-dir",
+          maxAge: 0,
+        },
+        {
+          fallthrough: false,
+          dir: "no-fallthrough-root-baseURL-dir",
+          baseURL: "/",
+          maxAge: 0,
+        },
+        {
+          baseURL: "with-default-fallthrough",
+          dir: "with-default-fallthrough-dir",
+          maxAge: 0,
+        },
+        {
+          fallthrough: false,
+          baseURL: "nested/no-fallthrough",
+          dir: "nested/no-fallthrough-dir",
+          maxAge: 0,
+        },
+      ];
+      expect(getStaticPaths(publicAssets, "/base")).toEqual([
+        "/.netlify/*",
+        "/base/with-default-fallthrough/*",
+        "/base/nested/no-fallthrough/*",
+      ]);
+    });
+  });
+
+  describe("generateNetlifyEdgeFunction", () => {
+    it("inlines the edge function config with static paths excluded", () => {
+      const fastnode = {
+        options: {
+          baseURL: "/",
+          framework: { name: "fastnode", version: "3.x" },
+          publicAssets: [{ baseURL: "build", dir: "build-dir", maxAge: 0 }],
+        },
+      } as unknown as Fastnode;
+      expect(generateNetlifyEdgeFunction(fastnode)).toMatchInlineSnapshot(`
+        "export { default } from "./main.mjs";
+        export const config = {
+          name: "edge server handler",
+          generator: "fastnode@3.x",
+          path: "/*",
+          excludedPath: ["/.netlify/*","/build/*"],
+        };"
+      `);
+    });
+  });
+
+  describe("writeConfig", () => {
+    it("removes stale config.json when config is empty", async () => {
+      const dir = await fsp.mkdtemp(join(tmpdir(), "fastnode-netlify-config-"));
+      const configPath = join(dir, "config.json");
+      await fsp.writeFile(configPath, JSON.stringify({ redirects: [] }));
+      await writeConfig({ options: { netlify: {} } } as unknown as Fastnode, configPath);
+      expect(existsSync(configPath)).toBe(false);
+      await fsp.rm(dir, { recursive: true, force: true });
+    });
+  });
+});
+
+describe("fastnode:preset:netlify-edge", async () => {
+  const ctx = await setupTest("netlify-edge", {
+    config: {
+      minify: false,
+      output: {
+        serverDir: resolve(getPresetTmpDir("netlify-edge"), ".output/server"),
+        publicDir: resolve(getPresetTmpDir("netlify-edge"), "dist"),
+      },
+    },
+  });
+
+  testBuiltinImports(ctx);
+
+  // Netlify Edge Functions run on Deno, which has no global `require`
+  const hasDeno =
+    execaSync("deno", ["--version"], { stdio: "ignore", reject: false }).exitCode === 0;
+  it.runIf(hasDeno)("requires builtins from bundled CommonJS on Deno", async () => {
+    const { stdout } = await execa(
+      "deno",
+      [
+        "eval",
+        `const { default: handler } = await import("./server.mjs");
+        const res = await handler(new Request("http://localhost/cjs-builtins"), {});
+        console.log(await res.text());`,
+      ],
+      { cwd: ctx.fastnode!.options.output.serverDir }
+    );
+    expect(stdout).toBe("ok");
+  });
+});

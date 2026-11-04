@@ -1,0 +1,93 @@
+import type { FastnodeConfig } from "fastnode/types";
+import { isDebug, isTest } from "std-env";
+import { version as fastnodeVersion } from "#fastnode/meta";
+
+export const FastnodeDefaults: FastnodeConfig = {
+  // General
+  compatibilityDate: "latest",
+  debug: isDebug,
+  logLevel: isTest ? 1 : 3,
+  runtimeConfig: { app: {}, fastnode: {} },
+
+  // Dirs
+  serverDir: false,
+  scanDirs: [],
+  buildDir: `node_modules/.fastnode`,
+  output: {
+    dir: "{{ rootDir }}/.output",
+    serverDir: "{{ output.dir }}/server",
+    publicDir: "{{ output.dir }}/public",
+  },
+
+  // Features
+  features: {},
+  experimental: {},
+  kv: {},
+  devStorage: {},
+  cache: {},
+  publicAssets: [],
+  serverAssets: [],
+  plugins: [],
+  tasks: {},
+  scheduledTasks: {},
+  scheduler: {},
+  virtual: {},
+  compressPublicAssets: false,
+  ignore: [],
+  scanSuffixes: [],
+  wasm: {},
+
+  // Dev
+  dev: false,
+  devServer: { watch: [] },
+  watchOptions: { ignoreInitial: true },
+  devProxy: {},
+
+  // Logging
+  logging: {
+    compressedSizes: true,
+    buildSuccess: true,
+  },
+
+  // Routing
+  baseURL: process.env.FASTNODE_APP_BASE_URL || "/",
+  handlers: [],
+  devHandlers: [],
+  errorHandler: undefined,
+  routes: {},
+  routeRules: {},
+  prerender: {
+    autoSubfolderIndex: true,
+    concurrency: 1,
+    interval: 0,
+    failOnError: false,
+    crawlLinks: false,
+    ignore: [],
+    routes: [],
+  },
+
+  // Builder
+  builder: undefined,
+  buildPlugins: [],
+  replace: {},
+  inject: {},
+  polyfills: [],
+  builtinModules: [],
+  node: true,
+  sourcemap: false,
+  traceDeps: [],
+
+  // Advanced
+  typescript: {
+    tsConfig: undefined,
+    tsconfigPaths: true,
+  },
+  hooks: {},
+  commands: {},
+
+  // Framework
+  framework: {
+    name: "fastnode",
+    version: fastnodeVersion,
+  },
+};

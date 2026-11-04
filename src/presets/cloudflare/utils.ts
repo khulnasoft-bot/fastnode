@@ -1,0 +1,465 @@
+import type { Fastnode } from "fastnode/types";
+import type { WranglerConfig, CloudflarePagesRoutes } from "./types.ts";
+import { existsSync } from "node:fs";
+import { readFile, rename } from "node:fs/promises";
+import { relative, dirname, extname } from "node:path";
+import { writeFile } from "../_utils/fs.ts";
+import { parseTOML, parseJSONC } from "confbox";
+import { readGitConfig, readPackageJSON, findNearestFile } from "pkg-types";
+import { defu } from "defu";
+import { glob } from "tinyglobby";
+import { join, resolve } from "pathe";
+import {
+  joinURL,
+  withLeadingSlash,
+  withTrailingSlash,
+  withoutLeadingSlash,
+  withoutTrailingSlash,
+} from "ufo";
+import { unenvCfNodeCompat } from "./unenv/preset.ts";
+import { getPublicAssetCorsHeaders } from "../_utils/cors.ts";
+import { hasHeaders, routeToSplat, skipUnsupportedRoute, sortRoutes } from "../_utils/routes.ts";
+import { extendEnv } from "../../build/env.ts";
+
+// https://github.com/khulnasoft/fastnode/issues/4527
+const NODEJS_COMPAT_SUPPORTED_FROM_DATE = "2024-09-23";
+const NODEJS_COMPAT_DEFAULT_ON_DATE = "2026-08-04";
+
+export async function writeCFRoutes(fastnode: Fastnode) {
+  const _cfPagesConfig = fastnode.options.cloudflare?.pages || {};
+  const routes: CloudflarePagesRoutes = {
+    version: _cfPagesConfig.routes?.version || 1,
+    include: _cfPagesConfig.routes?.include || ["/*"],
+    exclude: _cfPagesConfig.routes?.exclude || [],
+  };
+
+  const writeRoutes = () =>
+    writeFile(
+      resolve(fastnode.options.output.dir, "_routes.json"),
+      JSON.stringify(routes, undefined, 2),
+      true
+    );
+
+  if (_cfPagesConfig.defaultRoutes === false) {
+    await writeRoutes();
+    return;
+  }
+
+  // Exclude public assets from hitting the worker
+  const explicitPublicAssets = fastnode.options.publicAssets.filter((dir, index, array) => {
+    if (dir.fallthrough || !dir.baseURL) {
+      return false;
+    }
+
+    const normalizedBase = withoutLeadingSlash(dir.baseURL);
+
+    return !array.some(
+      (otherDir, otherIndex) =>
+        otherIndex !== index &&
+        normalizedBase.startsWith(withoutLeadingSlash(withTrailingSlash(otherDir.baseURL)))
+    );
+  });
+
+  // Explicit prefixes
+  routes.exclude!.push(
+    ...explicitPublicAssets
+      .map((asset) => joinURL(fastnode.options.baseURL, asset.baseURL || "/", "*"))
+      .sort(comparePaths)
+  );
+
+  // Unprefixed assets
+  const publicAssetFiles = await glob("**", {
+    cwd: fastnode.options.output.dir,
+    absolute: false,
+    dot: true,
+    ignore: [
+      "_worker.js",
+      "_worker.js.map",
+      "fastnode.json",
+      ...routes.exclude!.map((path) => withoutLeadingSlash(path.replace(/\/\*$/, "/**"))),
+    ],
+  });
+  // Remove index.html or the .html extension to support pages pre-rendering
+  routes.exclude!.push(
+    ...publicAssetFiles
+      .map(
+        (i) =>
+          withLeadingSlash(i)
+            .replace(/\/index\.html$/, "")
+            .replace(/\.html$/, "") || "/"
+      )
+      .sort(comparePaths)
+  );
+
+  // Only allow 100 rules in total (include + exclude)
+  routes.exclude!.splice(100 - routes.include!.length);
+
+  await writeRoutes();
+}
+
+function comparePaths(a: string, b: string) {
+  return a.split("/").length - b.split("/").length || a.localeCompare(b);
+}
+
+/**
+ * Write `_headers` to `public` (the public dir), `output` (the output dir) or `assets`: the root of
+ * the static assets directory, where Cloudflare reads it on Workers. With a baseURL, the user's own
+ * `_headers` is copied under it in the public dir, so it is moved from there.
+ */
+export async function writeCFHeaders(fastnode: Fastnode, outdir: "public" | "output" | "assets") {
+  const headersPath = join(
+    outdir === "assets"
+      ? getCFAssetsDir(fastnode)
+      : outdir === "public"
+        ? fastnode.options.output.publicDir
+        : fastnode.options.output.dir,
+    "_headers"
+  );
+  const userHeadersPath =
+    outdir === "assets" ? join(fastnode.options.output.publicDir, "_headers") : headersPath;
+  const contents = [];
+
+  for (const path of sortRoutes(Object.keys(fastnode.options.routeRules))) {
+    const routeRules = fastnode.options.routeRules[path]!;
+    if (
+      !hasHeaders(routeRules) ||
+      skipUnsupportedRoute(fastnode, { route: path, file: "_headers" })
+    ) {
+      continue;
+    }
+    const headers = [
+      joinURL(fastnode.options.baseURL, routeToSplat(path)),
+      ...Object.entries({ ...routeRules.headers }).map(
+        ([header, value]) => `  ${header}: ${value}`
+      ),
+    ].join("\n");
+
+    contents.push(headers);
+  }
+
+  const headersFile = existsSync(userHeadersPath)
+    ? await readFile(userHeadersPath, "utf8")
+    : undefined;
+  for (const { base, headers } of getPublicAssetCorsHeaders(fastnode, { headersFile })) {
+    contents.push(
+      [
+        joinURL(fastnode.options.baseURL, base, "*"),
+        ...Object.entries(headers).map(([header, value]) => `  ${header}: ${value}`),
+      ].join("\n")
+    );
+  }
+
+  if (headersFile !== undefined) {
+    if (userHeadersPath !== headersPath) {
+      await rename(userHeadersPath, headersPath);
+    }
+    if (/^\/\* /m.test(headersFile)) {
+      fastnode.logger.info(
+        "Not adding Fastnode fallback to `_headers` (as an existing fallback was found)."
+      );
+      return;
+    }
+    fastnode.logger.info("Adding Fastnode fallback to `_headers` to handle all unmatched routes.");
+    contents.unshift(headersFile);
+  }
+
+  await writeFile(headersPath, contents.join("\n"), true);
+}
+
+/**
+ * Move the user's `_redirects` to the root of the static assets directory, where Cloudflare reads
+ * it on Workers (with a baseURL, it is copied under it in the public dir).
+ */
+export async function moveCFRedirects(fastnode: Fastnode) {
+  const source = join(fastnode.options.output.publicDir, "_redirects");
+  const target = join(getCFAssetsDir(fastnode), "_redirects");
+  if (source !== target && existsSync(source)) {
+    await rename(source, target);
+  }
+}
+
+/** Root of the static assets directory: the public dir without its baseURL suffix. */
+export function getCFAssetsDir(fastnode: Fastnode): string {
+  const publicDir = withoutTrailingSlash(fastnode.options.output.publicDir);
+  const base = withoutTrailingSlash(fastnode.options.baseURL);
+  return base && publicDir.endsWith(base) ? publicDir.slice(0, -base.length) : publicDir;
+}
+
+export async function writeCFPagesRedirects(fastnode: Fastnode) {
+  const redirectsPath = join(fastnode.options.output.dir, "_redirects");
+  const staticFallback = existsSync(join(fastnode.options.output.publicDir, "404.html"))
+    ? `${joinURL(fastnode.options.baseURL, "/*")} ${joinURL(fastnode.options.baseURL, "/404.html")} 404`
+    : "";
+  const contents: string[] = [];
+
+  // Most specific first, as the first matching rule wins
+  const routes = sortRoutes(Object.keys(fastnode.options.routeRules));
+  const redirects = routes.filter((key) => fastnode.options.routeRules[key]!.redirect);
+  for (const key of routes) {
+    const redirect = fastnode.options.routeRules[key]!.redirect;
+    if (
+      !redirect ||
+      skipUnsupportedRoute(fastnode, { route: key, file: "_redirects", routes: redirects })
+    ) {
+      continue;
+    }
+    const code = redirect.status;
+    const from = joinURL(fastnode.options.baseURL, routeToSplat(key));
+    const to = redirect.to.replaceAll("**", ":splat");
+    contents.push(`${from}\t${to}\t${code}`);
+  }
+  contents.push(staticFallback);
+
+  if (existsSync(redirectsPath)) {
+    const currentRedirects = await readFile(redirectsPath, "utf8");
+    if (/^\/\* /m.test(currentRedirects)) {
+      fastnode.logger.info(
+        "Not adding Fastnode fallback to `_redirects` (as an existing fallback was found)."
+      );
+      return;
+    }
+    fastnode.logger.info(
+      "Adding Fastnode fallback to `_redirects` to handle all unmatched routes."
+    );
+    contents.unshift(currentRedirects);
+  }
+
+  await writeFile(redirectsPath, contents.join("\n"), true);
+}
+
+export async function enableNodeCompat(fastnode: Fastnode) {
+  fastnode.options.cloudflare ??= {};
+
+  fastnode.options.cloudflare.deployConfig ??= true;
+  fastnode.options.cloudflare.nodeCompat ??= true;
+  if (fastnode.options.cloudflare.nodeCompat) {
+    fastnode.options.rolldownConfig ??= {};
+    fastnode.options.rolldownConfig.platform ??= "node";
+    extendEnv(fastnode, unenvCfNodeCompat);
+  }
+}
+
+const extensionParsers = {
+  ".json": parseJSONC,
+  ".jsonc": parseJSONC,
+  ".toml": parseTOML,
+} as const;
+
+export async function readWranglerConfig(
+  fastnode: Fastnode
+): Promise<{ configPath?: string; config?: WranglerConfig }> {
+  const configPath = await findNearestFile(["wrangler.json", "wrangler.jsonc", "wrangler.toml"], {
+    startingFrom: fastnode.options.rootDir,
+  }).catch(() => undefined);
+  if (!configPath) {
+    return {};
+  }
+  const userConfigText = await readFile(configPath, "utf8");
+  const parser = extensionParsers[extname(configPath) as keyof typeof extensionParsers];
+  if (!parser) {
+    /* unreachable */
+    throw new Error(`Unsupported config file format: ${configPath}`);
+  }
+  const config = parser(userConfigText) as WranglerConfig;
+  return { configPath, config };
+}
+
+// https://developers.cloudflare.com/workers/wrangler/configuration/#generated-wrangler-configuration
+export async function writeWranglerConfig(fastnode: Fastnode, cfTarget: "pages" | "module") {
+  // Skip if not enabled
+  if (!fastnode.options.cloudflare?.deployConfig) {
+    return;
+  }
+
+  // Compute path to generated wrangler.json
+  const wranglerConfigDir = fastnode.options.output.serverDir;
+  const wranglerConfigPath = join(wranglerConfigDir, "wrangler.json");
+
+  // Default configs
+  const defaults: WranglerConfig = {};
+
+  // Config overrides
+  const overrides: WranglerConfig = {};
+
+  // Compatibility date
+  defaults.compatibility_date =
+    fastnode.options.compatibilityDate.cloudflare || fastnode.options.compatibilityDate.default;
+
+  if (cfTarget === "pages") {
+    // Pages
+    overrides.pages_build_output_dir = relative(wranglerConfigDir, fastnode.options.output.dir);
+  } else {
+    // Modules
+    const assetsDirectory = relative(
+      wranglerConfigDir,
+      resolve(
+        fastnode.options.output.publicDir,
+        "../".repeat(fastnode.options.baseURL.split("/").filter(Boolean).length)
+      )
+    );
+    if (fastnode.options.static) {
+      // No worker script is emitted; `main` and `assets.binding` only apply
+      // when there is one. https://developers.cloudflare.com/workers/static-assets/
+      overrides.assets = { directory: assetsDirectory };
+    } else {
+      overrides.main = relative(
+        wranglerConfigDir,
+        join(fastnode.options.output.serverDir, "index.mjs")
+      );
+      overrides.assets = {
+        binding: "ASSETS",
+        directory: assetsDirectory,
+      };
+    }
+  }
+
+  // Read user config
+  const { configPath: userConfigPath, config: userConfig = {} } =
+    await readWranglerConfig(fastnode);
+
+  // Fastnode context config (from frameworks and modules)
+  const ctxConfig = fastnode.options.cloudflare?.wrangler || {};
+
+  // `main` can point to the server entry, so `wrangler types` can type Durable Object bindings
+  const mainIsServerEntry =
+    !!userConfig.main &&
+    !!fastnode.options.serverEntry &&
+    resolve(dirname(userConfigPath!), userConfig.main) === fastnode.options.serverEntry.handler;
+
+  // Validate and warn about overrides
+  for (const key in overrides) {
+    if (key === "main" && mainIsServerEntry) {
+      continue;
+    }
+    let conflict: "ctx" | "user" | undefined;
+    if (key === "assets") {
+      conflict = findAssetsConflict(overrides.assets!, ctxConfig.assets, userConfig.assets, {
+        generatedDir: wranglerConfigDir,
+        userDir: userConfigPath ? dirname(userConfigPath) : fastnode.options.rootDir,
+      });
+    } else if (key in ctxConfig) {
+      conflict = "ctx";
+    } else if (key in userConfig) {
+      conflict = "user";
+    }
+    if (conflict) {
+      fastnode.logger.warn(
+        `[cloudflare] Wrangler config \`${key}\`${conflict === "ctx" ? " set by config or modules" : ""} is overridden and will be ignored.`
+      );
+    }
+  }
+
+  // (first argument takes precedence)
+  const wranglerConfig = defu(overrides, ctxConfig, userConfig, defaults) as WranglerConfig;
+
+  // Name is required
+  if (!wranglerConfig.name) {
+    wranglerConfig.name = await generateWorkerName(fastnode)!;
+    fastnode.logger.info(`Using auto generated worker name: \`${wranglerConfig.name}\``);
+  }
+
+  // Compatibility flags
+  wranglerConfig.compatibility_flags ??= [];
+  if (
+    fastnode.options.cloudflare?.nodeCompat &&
+    wranglerConfig.compatibility_date &&
+    wranglerConfig.compatibility_date >= NODEJS_COMPAT_SUPPORTED_FROM_DATE &&
+    wranglerConfig.compatibility_date < NODEJS_COMPAT_DEFAULT_ON_DATE &&
+    !wranglerConfig.compatibility_flags.includes("nodejs_compat")
+  ) {
+    wranglerConfig.compatibility_flags.push("nodejs_compat");
+  }
+
+  if (cfTarget === "module" && !fastnode.options.static) {
+    // Avoid double bundling
+    if (wranglerConfig.no_bundle === undefined) {
+      wranglerConfig.no_bundle = true;
+    }
+
+    // Scan all server/ chunks
+    wranglerConfig.rules ??= [];
+    if (!wranglerConfig.rules.some((rule) => rule.type === "ESModule")) {
+      wranglerConfig.rules.push({
+        type: "ESModule",
+        globs: ["**/*.mjs", "**/*.js"],
+      });
+    }
+  }
+
+  // Fastnode Tasks cron triggers
+  if (
+    fastnode.options.experimental.tasks &&
+    Object.keys(fastnode.options.scheduledTasks || {}).length > 0 &&
+    cfTarget !== "pages"
+  ) {
+    const schedules = Object.keys(fastnode.options.scheduledTasks!);
+    wranglerConfig.triggers = defu(wranglerConfig.triggers, { crons: [] });
+    const existingCrons = new Set(wranglerConfig.triggers!.crons);
+    for (const schedule of schedules) {
+      if (!existingCrons.has(schedule)) {
+        wranglerConfig.triggers!.crons!.push(schedule);
+      }
+    }
+  }
+
+  // Write wrangler.json
+  await writeFile(wranglerConfigPath, JSON.stringify(wranglerConfig, null, 2), true);
+
+  const configPath = join(fastnode.options.rootDir, ".wrangler/deploy/config.json");
+
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      configPath: relative(dirname(configPath), wranglerConfigPath),
+    }),
+    true
+  );
+}
+
+async function generateWorkerName(fastnode: Fastnode) {
+  const gitConfig = await readGitConfig(fastnode.options.rootDir).catch(() => undefined);
+  const gitRepo = gitConfig?.remote?.origin?.url
+    ?.replace(/\.git$/, "")
+    .match(/[/:]([^/]+\/[^/]+)$/)?.[1];
+  const pkgJSON = await readPackageJSON(fastnode.options.rootDir).catch(() => undefined);
+  const pkgName = pkgJSON?.name;
+  const subpath = relative(fastnode.options.workspaceDir, fastnode.options.rootDir);
+  return `${gitRepo || pkgName}/${subpath}`
+    .toLowerCase()
+    .replace(/[^a-zA-Z0-9-]/g, "-")
+    .replace(/-$/, "");
+}
+
+type WranglerAssets = NonNullable<WranglerConfig["assets"]>;
+
+// Returns the source of an asset `binding` or `directory` that differs from the generated one.
+// Context config is copied into the generated config (relative to `generatedDir`),
+// while user config paths are relative to the user wrangler config (`userDir`).
+function findAssetsConflict(
+  expected: Partial<WranglerAssets>,
+  ctxAssets: Partial<WranglerAssets> | undefined,
+  userAssets: Partial<WranglerAssets> | undefined,
+  opts: { generatedDir: string; userDir: string }
+): "ctx" | "user" | undefined {
+  for (const field of ["binding", "directory"] as const) {
+    // Static builds only generate `directory`
+    if (expected[field] === undefined) {
+      continue;
+    }
+    // Context config takes precedence over user config (null means unset in JSON)
+    const source = ctxAssets?.[field] == null ? "user" : "ctx";
+    const value = (source === "ctx" ? ctxAssets : userAssets)?.[field];
+    if (value == null) {
+      continue;
+    }
+    const isConflict =
+      field === "directory"
+        ? resolve(source === "ctx" ? opts.generatedDir : opts.userDir, value) !==
+          resolve(opts.generatedDir, expected.directory!)
+        : value !== expected.binding;
+    if (isConflict) {
+      return source;
+    }
+  }
+  return undefined;
+}

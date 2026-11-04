@@ -1,0 +1,1134 @@
+import { promises as fsp } from "node:fs";
+import { Server, type RequestListener } from "node:http";
+import { tmpdir } from "node:os";
+import { formatDate } from "compatx";
+import type { DateString } from "compatx";
+import { defu } from "defu";
+import destr from "destr";
+import { fileURLToPath } from "mlly";
+import {
+  build,
+  copyPublicAssets,
+  createDevServer,
+  createFastnode,
+  prepare,
+  prerender,
+} from "fastnode/builder";
+import type { Fastnode, FastnodeConfig } from "fastnode/types";
+import { join, resolve } from "pathe";
+import { isBun, isWindows } from "std-env";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+export interface Context {
+  preset: string;
+  fastnode?: Fastnode;
+  rootDir: string;
+  outDir: string;
+  fetch: (url: string, opts?: RequestInit) => Promise<any>;
+  server?: { url: string; close: () => Promise<void> };
+  isDev: boolean;
+  isWorker: boolean;
+  isLambda: boolean;
+  env: Record<string, string>;
+  lambdaV1?: boolean;
+  // [key: string]: unknown;
+}
+
+// https://github.com/khulnasoft/fastnode/pull/1240
+export const describeIf = (condition: boolean, title: string, factory: () => any) =>
+  condition
+    ? describe(title, factory)
+    : describe(title, () => {
+        it.skip("skipped", () => {
+          // Ignore
+        });
+      });
+
+export const fixtureDir = fileURLToPath(new URL("fixture", import.meta.url).href);
+
+export const getPresetTmpDir = (preset: string) => {
+  if (preset.startsWith("cloudflare")) {
+    return fileURLToPath(new URL(`.tmp/${preset}`, import.meta.url) as any /* remove me */);
+  }
+
+  return resolve(process.env.FASTNODE_TEST_TMP_DIR || join(tmpdir(), "fastnode-tests"), preset);
+};
+
+export async function setupTest(
+  preset: string,
+  opts: {
+    config?: FastnodeConfig;
+    compatibilityDate?: DateString;
+    outDirSuffix?: string;
+  } = {}
+) {
+  const presetTmpDir = getPresetTmpDir(preset + (opts.outDirSuffix || ""));
+
+  await fsp.rm(presetTmpDir, { recursive: true }).catch(() => {
+    // Ignore
+  });
+  await fsp.mkdir(presetTmpDir, { recursive: true });
+
+  const ctx: Context = {
+    preset,
+    isDev: preset === "fastnode-dev",
+    isWorker: [
+      "cloudflare-worker",
+      "cloudflare-module",
+      "cloudflare-module-legacy",
+      "cloudflare-pages",
+      "netlify-edge",
+    ].includes(preset),
+    isLambda: ["aws-lambda", "netlify-legacy"].includes(preset),
+    rootDir: fixtureDir,
+    outDir: resolve(fixtureDir, presetTmpDir, ".output"),
+    env: {
+      FASTNODE_HELLO: "world",
+      CUSTOM_HELLO_THERE: "general",
+      SECRET: "secret",
+      APP_DOMAIN: "test.com",
+      FASTNODE_DYNAMIC: "from-env",
+    },
+    fetch: (url, opts) =>
+      fetch(new URL(url, ctx.server!.url), {
+        redirect: "manual",
+        ...(opts as any),
+      }),
+  };
+
+  // Set environment variables for process compatible presets
+  for (const [name, value] of Object.entries(ctx.env)) {
+    process.env[name] = value;
+  }
+
+  const config = defu(opts.config, {
+    preset: ctx.preset,
+    dev: ctx.isDev,
+    rootDir: ctx.rootDir,
+    runtimeConfig: {
+      fastnode: {
+        envPrefix: "CUSTOM_",
+      },
+      hello: "",
+      helloThere: "",
+    },
+    buildDir: resolve(fixtureDir, presetTmpDir, ".fastnode"),
+    serveStatic: !ctx.isDev && !ctx.isWorker,
+    output: {
+      dir: ctx.outDir,
+    },
+  });
+  const fastnode = (ctx.fastnode = await createFastnode(config, {
+    compatibilityDate: opts.compatibilityDate || formatDate(new Date()),
+  }));
+
+  // Isolate the default sqlite database per preset build (defaults to `<cwd>/.data/db.sqlite`),
+  // otherwise parallel test files race on the same file ("database is locked").
+  const defaultDatabase = fastnode.options.database?.default;
+  if (defaultDatabase?.connector === "sqlite" && !defaultDatabase.options?.path) {
+    defaultDatabase.options = {
+      ...defaultDatabase.options,
+      path: resolve(presetTmpDir, ".data/db.sqlite"),
+    };
+  }
+
+  if (ctx.isDev) {
+    // Setup development server
+    const devServer = createDevServer(ctx.fastnode);
+    const server = await devServer.listen({ port: 0 });
+    ctx.server = {
+      url: server.url!,
+      close: () => server.close(),
+    };
+    await prepare(ctx.fastnode);
+    const ready = new Promise<void>((resolve) => {
+      ctx.fastnode!.hooks.hook("dev:reload", () => resolve());
+    });
+    await build(ctx.fastnode);
+    await ready;
+  } else {
+    // Production build
+    await prepare(fastnode);
+    await copyPublicAssets(fastnode);
+    await prerender(fastnode);
+    await build(fastnode);
+  }
+
+  afterAll(async () => {
+    if (ctx.server) {
+      await ctx.server.close();
+    }
+    if (ctx.fastnode) {
+      await ctx.fastnode.close();
+    }
+  });
+
+  return ctx;
+}
+
+export async function startServer(ctx: Context, handle: RequestListener) {
+  const server = new Server(handle);
+  await new Promise<void>((resolve, reject) => {
+    server.on("error", reject);
+    server.listen(0, () => resolve());
+  });
+  const port = (server.address() as any).port;
+  ctx.server = {
+    url: `http://localhost:${port}`,
+    close: () =>
+      new Promise((resolve, reject) => {
+        server.close((err) => {
+          if (err) return reject(err);
+          resolve();
+        });
+      }),
+  };
+}
+
+type TestHandlerResult = {
+  data: any;
+  status: number;
+  statusText?: string;
+  headers: Record<string, string | string[]>;
+};
+type TestHandler = (options: any) => Promise<TestHandlerResult | Response>;
+
+export function testFastnode(
+  ctx: Context,
+  getHandler: () => TestHandler | Promise<TestHandler>,
+  additionalTests?: (
+    ctx: Context,
+    callHandler: (options: any) => Promise<TestHandlerResult>
+  ) => void
+) {
+  let _handler: TestHandler;
+
+  async function callHandler(
+    options: any,
+    callOpts: { binary?: boolean } = {}
+  ): Promise<TestHandlerResult> {
+    const result = await _handler(options);
+    if (
+      !(result instanceof Response) &&
+      !["Response", "_Response"].includes(result.constructor.name)
+    ) {
+      throw new TypeError("Expected Response");
+    }
+
+    const headers: Record<string, string | string[]> = {};
+    for (const [key, value] of (result as Response).headers.entries()) {
+      if (headers[key]) {
+        if (!Array.isArray(headers[key])) {
+          headers[key] = [headers[key] as string];
+        }
+        if (Array.isArray(value)) {
+          (headers[key] as string[]).push(...value);
+        } else {
+          (headers[key] as string[]).push(value);
+        }
+      } else {
+        headers[key] = value;
+      }
+    }
+    headers["set-cookie"] = (result as Response).headers.getSetCookie();
+    if (headers["set-cookie"].length === 0) {
+      delete headers["set-cookie"];
+    }
+
+    return {
+      data: callOpts.binary
+        ? Buffer.from(await (result as Response).arrayBuffer())
+        : destr(await (result as Response).text()),
+      status: result.status,
+      statusText: result.statusText,
+      headers,
+    };
+  }
+
+  beforeAll(async () => {
+    _handler = await getHandler();
+  }, 25_000);
+
+  it("Server entry works", async () => {
+    const { data, headers } = await callHandler({ url: "/" });
+    expect(data).toBe("server entry works!");
+    expect(headers["x-test"]).toBe("test");
+  });
+
+  it("async plugins are awaited before handling requests", async () => {
+    const { headers } = await callHandler({ url: "/" });
+    expect(headers["x-async-plugin"]).toBe("async plugin works!");
+  });
+
+  it("server entry middleware and plugins are not passed to srvx", async () => {
+    const { data, headers } = await callHandler({ url: "/srvx-middleware" });
+    expect(data).not.toBe("server entry middleware works!");
+    expect(headers["x-srvx-plugin"]).toBeUndefined();
+  });
+
+  it("global Response is srvx FastResponse in Node.js", async () => {
+    const { data, headers } = await callHandler({ url: "/fast-response" });
+    expect(data).toBe("fast response");
+    expect(headers["x-init"]).toBe("1");
+    expect(JSON.parse(headers["x-fast-response"] as string)).toEqual({
+      // srvx `FastResponse` is the native `Response` outside of Node.js
+      fast:
+        ctx.fastnode!.options.node &&
+        !["bun", "deno-server", "standard"].includes(ctx.preset) &&
+        !ctx.fastnode!.options.exportConditions?.includes("bun"),
+      statics: true,
+      subclass: true,
+    });
+  });
+
+  // On Bun, the dev worker closes the socket and the dev proxy responds with 500 instead of 413
+  // https://github.com/unjs/env-runner/issues/97
+  it.runIf(["bun", "deno-server", "fastnode-dev"].includes(ctx.preset) && !(ctx.isDev && isBun))(
+    "Server entry options are passed to srvx",
+    async () => {
+      const small = await callHandler({
+        url: "/api/body-size",
+        method: "POST",
+        body: "x".repeat(1024),
+      });
+      expect(small.data).toEqual({ length: 1024 });
+      const large = await callHandler({
+        url: "/api/body-size",
+        method: "POST",
+        body: "x".repeat(128 * 1024),
+      });
+      expect(large.status).toBe(413);
+    }
+  );
+
+  it("middleware runs in order: route rules, global, routed, then the route handler", async () => {
+    const { data, headers } = await callHandler({ url: "/api/middleware-order" });
+    // `rules` is recorded by the global middleware when `event.context.routeRules`
+    // is already populated, i.e. route rules resolved before it ran.
+    expect(data).toEqual(["rules", "global", "routed"]);
+    expect(headers["x-test"]).toBe("test");
+  });
+
+  it("global middleware runs before cached (`swr`) route handlers", async () => {
+    const url = "/rules/swr/middleware-order";
+    // miss, then hits: the middleware must run each time, and the header it
+    // sets must not be stored in the shared cache entry
+    const miss = await callHandler({ url, headers: { "x-echo": "a" } });
+    expect(miss.data).toEqual(["rules", "global", "routed"]);
+    expect(miss.headers["x-echo"]).toBe("a");
+    const hit = await callHandler({ url, headers: { "x-echo": "b" } });
+    expect(hit.data).toEqual(["rules", "global", "routed"]);
+    expect(hit.headers["x-echo"]).toBe("b");
+    const anonymous = await callHandler({ url });
+    expect(anonymous.headers["x-echo"]).toBeUndefined();
+  });
+
+  it("global and routed middleware run for non-GET requests to cached (`swr`) routes", async () => {
+    const { data } = await callHandler({ url: "/rules/swr/middleware-order", method: "POST" });
+    expect(data).toEqual(["rules", "global", "routed"]);
+  });
+
+  it("keeps middleware headers out of `defineCachedHandler` cache entries", async () => {
+    const url = "/api/cached-middleware";
+    const miss = await callHandler({ url, headers: { "x-echo": "a" } });
+    expect(miss.data).toBe("cached");
+    expect(miss.headers["x-echo"]).toBe("a");
+    const hit = await callHandler({ url, headers: { "x-echo": "b" } });
+    expect(hit.headers["x-echo"]).toBe("b");
+    const anonymous = await callHandler({ url });
+    expect(anonymous.headers["x-echo"]).toBeUndefined();
+  });
+
+  it("API Works", async () => {
+    const { data: helloData } = await callHandler({ url: "/api/hello" });
+    expect(helloData).to.toMatchObject({ message: "Hello API" });
+
+    if (ctx.fastnode?.options.serveStatic) {
+      // /api/hey is expected to be prerendered
+      const { data: heyData } = await callHandler({ url: "/api/hey" });
+      expect(heyData).to.have.string("Hey API");
+    }
+
+    const { data: kebabData } = await callHandler({ url: "/api/kebab" });
+    expect(kebabData).to.have.string("hello-world");
+
+    const { data: paramsData } = await callHandler({
+      url: "/api/param/test_param",
+    });
+    expect(paramsData).toBe("test_param");
+
+    const { data: paramsData2 } = await callHandler({
+      url: "/api/wildcard/foo/bar/baz",
+    });
+    expect(paramsData2).toBe("foo/bar/baz");
+  });
+
+  it("named catch-all route matches its base path", async () => {
+    const base = await callHandler({ url: "/api/catch-all" });
+    expect(base.status).toBe(200);
+    expect(base.data).toEqual({ route: "catch-all", params: {} });
+
+    const slash = await callHandler({ url: "/api/catch-all/" });
+    expect(slash.status).toBe(200);
+    expect(slash.data).toEqual({ route: "catch-all", params: { slug: "" } });
+
+    const { data: deep } = await callHandler({ url: "/api/catch-all/foo/bar" });
+    expect(deep).toEqual({ route: "catch-all", params: { slug: "foo/bar" } });
+
+    for (const url of ["/api/catch-all-index", "/api/catch-all-index/"]) {
+      const { data } = await callHandler({ url });
+      expect(data, url).toMatchObject({ route: "index" });
+    }
+    const { data: deepIndex } = await callHandler({ url: "/api/catch-all-index/foo" });
+    expect(deepIndex).toEqual({ route: "catch-all", params: { slug: "foo" } });
+  });
+
+  it("group routes", async () => {
+    const { status } = await callHandler({ url: "/route-group" });
+    expect(status).toBe(200);
+    const { status: apiStatus } = await callHandler({
+      url: "/route-group",
+    });
+    expect(apiStatus).toBe(200);
+  });
+
+  it("Handle 404 not found", async () => {
+    const res = await callHandler({ url: "/api/not-found" });
+    expect(res.status).toBe(404);
+  });
+
+  it("Virtual route", async () => {
+    const res = await callHandler({ url: "/virtual" });
+    expect(res.status).toBe(200);
+    expect(res.data).toBe("Hello from virtual entry!");
+  });
+
+  it("applies `buildPlugins`", async () => {
+    const res = await callHandler({ url: "/build-plugins" });
+    expect(res.data).toEqual({ message: "Hello from build plugin!", transform: "transformed" });
+  });
+
+  // TODO
+  it.todo("Handle 405 method not allowed", async () => {
+    const res = await callHandler({ url: "/api/upload" });
+    expect(res.status).toBe(405);
+  });
+
+  it("handles route rules - redirects", async () => {
+    const base = await callHandler({ url: "/rules/redirect" });
+    expect(base.status).toBe(307);
+    expect(base.headers.location).toBe("/base");
+
+    const obj = await callHandler({ url: "/rules/redirect/obj" });
+    expect(obj.status).toBe(308);
+    expect(obj.headers.location).toBe("https://fastnode.khulnasoft.com/");
+
+    const wildcard = await callHandler({
+      url: "/rules/redirect/wildcard/nuxt",
+    });
+    expect(wildcard.status).toBe(307);
+    expect(wildcard.headers.location).toBe("https://fastnode.khulnasoft.com/nuxt");
+
+    // Regression test for GHSA-9phm-9p8f-hw5m: a leading `//` after the
+    // wildcard prefix must not be forwarded as a protocol-relative URL.
+    const legacy = await callHandler({
+      url: "/rules/redirect/legacy//evil.com",
+    });
+    expect(legacy.status).toBe(307);
+    expect(legacy.headers.location).not.toMatch(/^\/\//);
+    expect(legacy.headers.location).toBe("/evil.com");
+  });
+
+  it("binary response", async () => {
+    const { data } = await callHandler({ url: "/icon.png" }, { binary: true });
+    // Check if buffer is a png
+    function isBufferPng(buffer: Buffer) {
+      return buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47;
+    }
+    expect(isBufferPng(data)).toBe(true);
+  });
+
+  it.skipIf(
+    // TODO: srvx reverse-compat bug with streaming?
+    ctx.preset === "vercel" && ctx.fastnode?.options.vercel?.entryFormat === "node"
+  )("render JSX", async () => {
+    const { data } = await callHandler({ url: "/jsx" });
+    expect(data).toMatch(/<h1 class="test".*>Hello JSX!<\/h1>/);
+  });
+
+  it("replace", async () => {
+    const { data } = await callHandler({ url: "/replace" });
+    expect(data).toMatchObject({ window: false });
+  });
+
+  it.runIf(ctx.fastnode?.options.serveStatic)("handles custom Vary header", async () => {
+    let headers = (
+      await callHandler({
+        url: "/foo.css",
+        headers: { "Accept-Encoding": "gzip" },
+      })
+    ).headers;
+    if (headers["vary"]) {
+      expect(headers["vary"].includes("Origin")).toBeTruthy();
+      expect(headers["vary"].includes("Accept-Encoding")).toBeTruthy();
+    }
+
+    headers = (
+      await callHandler({
+        url: "/foo.css",
+        headers: { "Accept-Encoding": "" },
+      })
+    ).headers;
+    if (headers["vary"]) {
+      expect(headers["vary"]).toBe("Origin");
+    }
+
+    headers = (
+      await callHandler({
+        url: "/foo.js",
+        headers: { "Accept-Encoding": "gzip" },
+      })
+    ).headers;
+    if (headers["vary"]) {
+      expect(headers["vary"].includes("Origin")).toBeTruthy();
+      expect(headers["vary"].includes("Accept-Encoding")).toBeTruthy();
+    }
+  });
+
+  it("handles route rules - headers", async () => {
+    const { headers } = await callHandler({ url: "/rules/headers" });
+    expect(headers["cache-control"]).toBe("s-maxage=60");
+  });
+
+  it("handles route rules - cors", async () => {
+    // `cors: true` is handled by h3's `handleCors` (via `h3/rules`). On a
+    // simple (non-preflight) request it sets permissive origin/methods/expose
+    // headers; `access-control-allow-headers` / `access-control-max-age` are
+    // preflight-only and answered on the `OPTIONS` preflight instead.
+    const expectedHeaders = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET",
+      "access-control-expose-headers": "*",
+    };
+    const { headers } = await callHandler({ url: "/rules/cors" });
+    expect(headers).toMatchObject(expectedHeaders);
+  });
+
+  it("applies a single-wildcard rule to an encoded separator", async () => {
+    // h3 serves the `/single-headers/[id]` handler on the raw path, so a rule it
+    // matches there (`/single-headers/*`) must still apply for
+    // `/single-headers/a%2fb` even though it canonicalizes to two segments —
+    // canonicalization must not drop rules off the path that is actually served.
+    const { status, headers } = await callHandler({
+      url: "/single-headers/a%2fb",
+    });
+    expect(status).toBe(200);
+    expect(headers["x-single"]).toBe("single");
+  });
+
+  describe("handles route rules - method scoped", () => {
+    // `"POST /rules/method-scoped/**"` enables CORS for POST requests only;
+    // other methods fall through unaffected.
+    it("does not apply the POST-scoped rule to other methods", async () => {
+      const { status, headers } = await callHandler({ url: "/rules/method-scoped/page" });
+      expect(status).toBe(200);
+      expect(headers["access-control-allow-origin"]).toBeUndefined();
+    });
+
+    it("applies the POST-scoped rule to matching requests", async () => {
+      const { status, headers } = await callHandler({
+        url: "/rules/method-scoped/page",
+        method: "POST",
+      });
+      expect(status).toBe(200);
+      expect(headers["access-control-allow-origin"]).toBe("*");
+    });
+
+    it("applies a GET-scoped redirect to GET requests only", async () => {
+      const get = await callHandler({ url: "/rules/method-scoped/redirect" });
+      expect(get.status).toBe(307);
+      expect(get.headers.location).toBe("/base");
+
+      const post = await callHandler({ url: "/rules/method-scoped/redirect", method: "POST" });
+      expect(post.status).toBe(200);
+      expect(post.data).toBe("/rules/method-scoped/redirect");
+      expect(post.headers.location).toBeUndefined();
+    });
+  });
+
+  it("handles route rules - allowing overriding", async () => {
+    const override = await callHandler({ url: "/rules/nested/override" });
+    expect(override.headers.location).toBe("/other");
+    expect(override.headers["x-test"]).toBe("test");
+
+    const base = await callHandler({ url: "/rules/nested/base" });
+    expect(base.headers.location).toBe("/base");
+    expect(base.headers["x-test"]).toBe("test");
+  });
+
+  it.skipIf(
+    // TODO!
+    ctx.preset === "vercel" && ctx.fastnode?.options.vercel?.entryFormat === "node" && isWindows
+  )("handles custom server assets", async () => {
+    const { data: html, status: htmlStatus } = await callHandler({
+      url: "/file?filename=index.html",
+    });
+    expect(htmlStatus).toBe(200);
+    expect(html).toContain("<h1>fastnode is amazing!</h1>");
+
+    const { data: txtFile, status: txtStatus } = await callHandler({
+      url: "/file?filename=test.txt",
+    });
+    expect(txtStatus).toBe(200);
+    expect(txtFile).toContain("this is an asset from a text file from fastnode");
+
+    const { data: mdFile, status: mdStatus } = await callHandler({
+      url: "/assets/md",
+    });
+    expect(mdStatus).toBe(200);
+    expect(mdFile).toContain("# Hello world");
+  });
+
+  it.skipIf(ctx.isWorker)(
+    "emits files referenced with `new URL(..., import.meta.url)`",
+    async () => {
+      const { data, status } = await callHandler({ url: "/asset-url" });
+      expect(status).toBe(200);
+      expect(data.file).toMatch(/^test-.+\.txt$/);
+      expect(data.text).toContain("this is an asset from a text file from fastnode");
+      expect(data.same).toBe(true);
+      expect(data.source).toBe('new URL("../files/test.txt", import.meta.url)');
+    }
+  );
+
+  if (ctx.fastnode!.options.serveStatic) {
+    it("serve static asset /favicon.ico", async () => {
+      const { status, headers } = await callHandler({ url: "/favicon.ico" });
+      expect(status).toBe(200);
+      expect(headers.etag).toBeDefined();
+      expect(headers["content-type"]).toBe("image/vnd.microsoft.icon");
+    });
+
+    it("serve static asset /build/test.txt", async () => {
+      const { status, headers } = await callHandler({ url: "/build/test.txt" });
+      expect(status).toBe(200);
+      expect(headers.etag).toBe('"7-vxGfAKTuGVGhpDZqQLqV60dnKPw"');
+      expect(headers["content-type"]).toBe("text/plain; charset=utf-8");
+    });
+
+    it("serve static asset via internal fetch", async () => {
+      const { data } = await callHandler({ url: "/fetch-public-asset" });
+      expect(data.status).toBe(200);
+      expect(data.body).toBe("Works!\n");
+    });
+
+    it("stores content-type for prerendered routes", async () => {
+      const { data, headers } = await callHandler({
+        url: "/api/param/prerender4",
+      });
+      expect(data).toBe("prerender4");
+      expect(headers["content-type"]).toBe("text/plain; custom");
+    });
+  }
+
+  it("shows 404 for /build/non-file", async () => {
+    const { status, headers } = await callHandler({ url: "/build/non-file" });
+    expect(status).toBe(404);
+    // The dev server serves public asset dirs itself, without route rules
+    if (!ctx.isDev) {
+      expect(headers["cache-control"]).toBe("no-store");
+    }
+  });
+
+  it("resolves utils from server/utils", async () => {
+    const res = await callHandler({ url: "/imports" });
+    expect(res.data).toMatchObject({
+      testUtil: 123,
+      testNestedUtil: 1234 + 12_345,
+    });
+  });
+
+  it.skipIf(ctx.preset === "deno-server")("resolve module version conflicts", async () => {
+    const { data } = await callHandler({ url: "/modules" });
+    expect(data).toMatchObject({
+      depA: "@fixture/fastnode-lib@1.0.0+@fixture/nested-lib@1.0.0",
+      depB: "@fixture/fastnode-lib@2.0.1+@fixture/nested-lib@2.0.1",
+      depLib: "@fixture/fastnode-lib@2.0.0+@fixture/nested-lib@2.0.0",
+      subpathLib: "@fixture/fastnode-lib@2.0.0",
+      extraUtils: "@fixture/fastnode-utils/extra",
+      cjsRequirer: "@fixture/fastnode-native-mock",
+      bundledDep: "@fixture/fastnode-lib@3.0.0",
+      cjsNestedRequirer: "@fixture/fastnode-lib@4.0.0",
+      cjsShadowedRequirer: "@fixture/fastnode-lib@5.0.0",
+    });
+  });
+
+  it("requires builtins from bundled CommonJS", async () => {
+    const { data } = await callHandler({ url: "/cjs-builtins" });
+    expect(data).toBe("ok");
+  });
+
+  it("externalizes a traced package's root export by its bare name", async () => {
+    const { data } = await callHandler({ url: "/traced-root-export" });
+    expect(data).toBe("@fixture/fastnode-root-export");
+  });
+
+  it("useKV (with base)", { retry: 5 }, async () => {
+    const putRes = await callHandler({
+      url: "/api/storage/item?key=test:hello",
+      method: "PUT",
+      body: `"world"`,
+    });
+    expect(putRes.data).toBe("world");
+
+    expect(
+      (
+        await callHandler({
+          url: "/api/storage/item?key=:",
+        })
+      ).data
+    ).toMatchObject(["test:hello"]);
+
+    expect(
+      (
+        await callHandler({
+          url: "/api/storage/item?base=test&key=:",
+        })
+      ).data
+    ).toMatchObject(["hello"]);
+
+    expect(
+      (
+        await callHandler({
+          url: "/api/storage/item?base=test&key=hello",
+        })
+      ).data
+    ).toBe("world");
+
+    expect((await callHandler({ url: "/api/storage/legacy?base=test&key=hello" })).data).toBe(
+      "world"
+    );
+  });
+
+  if (additionalTests) {
+    additionalTests(ctx, callHandler);
+  }
+
+  it("runtime proxy", async () => {
+    const { data } = await callHandler({
+      url: "/api/proxy?foo=bar",
+      headers: {
+        "x-test": "foobar",
+      },
+    });
+    expect(data.url).toBe("/api/echo?foo=bar");
+    if (!(ctx.preset === "vercel" && ctx.fastnode?.options.vercel?.entryFormat === "node")) {
+      // TODO: Investigate why headers are missing in this case
+      expect(data.headers["x-test"]).toBe("foobar");
+    }
+  });
+
+  it("runtime proxy collapses leading slashes after wildcard prefix", async () => {
+    // Regression test for GHSA-9phm-9p8f-hw5m: a leading `//` after the
+    // wildcard prefix must not be forwarded verbatim to the upstream.
+    const { data } = await callHandler({
+      url: "/rules/proxy/legacy//evil.com",
+    });
+    expect(data).toBe("evil.com");
+  });
+
+  it("runtime proxy keeps an encoded separator opaque for the upstream", async () => {
+    // Regression: an opaque `%2f` inside a segment is a single path segment for
+    // the in-scope request and must be forwarded encoded — not decoded into a
+    // real separator (which would change the resource the upstream resolves).
+    const { data } = await callHandler({
+      url: "/rules/proxy/legacy/a%2fb",
+    });
+    expect(data).toBe("a%2fb");
+  });
+
+  it("external proxy", async () => {
+    const { data, headers, status } = await callHandler({
+      url: "/cdn/npm/bootstrap@5.3.8/dist/js/bootstrap.min.js",
+    });
+    expect(status).toBe(200);
+    expect(headers["etag"]).toMatch(/W\/".+"/);
+    expect(data).toContain("Bootstrap");
+  });
+
+  it.skipIf(ctx.preset === "bun" /* TODO */)("stream", async () => {
+    const { data } = await callHandler({
+      url: "/stream",
+    });
+    expect(data).toBe("fastnodeisawesome");
+  });
+
+  it("config", async () => {
+    const { data } = await callHandler({
+      url: "/config",
+    });
+    expect(data).toMatchObject({
+      runtimeConfig: {
+        dynamic: "from-env",
+        url: "https://test.com",
+        app: {
+          baseURL: "/",
+        },
+      },
+      sharedRuntimeConfig: {
+        dynamic: ctx.preset === "cloudflare-module-legacy" ? "initial" : "from-env",
+        // url: "https://test.com",
+        app: {
+          baseURL: "/",
+        },
+      },
+    });
+  });
+
+  it("static build flags", async () => {
+    const { data } = await callHandler({ url: "/static-flags" });
+    expect(data).toMatchObject({
+      dev: ctx.isDev,
+      envName: ctx.isDev ? "development" : "production",
+      preset: ctx.preset,
+      prerender: false,
+      fastnode: true,
+      server: true,
+      client: false,
+      baseURL: "/",
+      _asyncContext: true,
+      _tasks: true,
+    });
+  });
+
+  it("event.waitUntil", async () => {
+    const res = await callHandler({ url: "/wait-until" });
+    expect(res.data).toBe("done");
+  });
+
+  describe("ignore", () => {
+    it("server routes should be ignored", async () => {
+      expect((await callHandler({ url: "/api/_ignored" })).status).toBe(404);
+      expect((await callHandler({ url: "/_ignored" })).status).toBe(404);
+    });
+
+    it.skipIf(ctx.isWorker || ctx.isDev)("public files should be ignored", async () => {
+      expect((await callHandler({ url: "/_ignored.txt" })).status).toBe(404);
+      expect((await callHandler({ url: "/favicon.ico" })).status).toBe(200);
+    });
+  });
+
+  describe("headers", () => {
+    it("handles headers correctly", async () => {
+      const { headers } = await callHandler({ url: "/api/headers" });
+      expect(headers["x-foo"]).toBe("bar");
+      expect(headers["x-array"]).toMatch(/^foo,\s?bar$/);
+      const expectedCookies: string | string[] = [
+        "foo=bar",
+        "bar=baz",
+        "test=value; Path=/",
+        "test2=value; Path=/",
+      ];
+      expect(headers["set-cookie"]).toMatchObject(expectedCookies);
+    });
+  });
+
+  describe("errors", () => {
+    it("captures errors", async () => {
+      await callHandler({ url: "/errors/throw" });
+      const { data } = await callHandler({ url: "/errors/captured" });
+      const allErrorMessages = (data.allErrors || []).map((entry: any) => entry.message);
+      expect(allErrorMessages).to.includes("Handled error");
+    });
+
+    it.skipIf(
+      !ctx.fastnode!.options.node ||
+        // TODO: Investigate
+        ctx.preset === "bun" ||
+        ctx.preset === "deno-server" ||
+        ctx.preset === "fastnode-dev"
+    )("sourcemap works", async () => {
+      const { data } = await callHandler({ url: "/errors/stack" });
+      expect(data.stack).toMatch("test/fixture/server/routes/errors/stack.ts");
+    });
+
+    for (const errorType of ["handled", "unhandled"]) {
+      it(`applies event.res.errHeaders (${errorType})`, async () => {
+        const consoleErrorMock = vi.spyOn(console, "error").mockImplementation(() => {});
+        let res;
+        try {
+          res = await callHandler({
+            url: `/errors/err-headers?${errorType}`,
+            headers: { Accept: "application/json" },
+          });
+        } finally {
+          consoleErrorMock.mockRestore();
+        }
+        expect(res.status).toBe(errorType === "handled" ? 403 : 500);
+        expect(res.headers["x-err-header"]).toBe("err-value");
+        expect(res.headers["set-cookie"]).toMatchObject(["err=1; Path=/"]);
+        expect(res.headers["x-success-only"]).toBeUndefined();
+      });
+    }
+
+    for (const errorAction of ["throw", "return"]) {
+      it(`handled errors (${errorAction})`, async () => {
+        const res = await callHandler({ url: `/errors/throw?handled&action=${errorAction}` });
+        expect(res).toMatchObject({
+          status: 503,
+          // Bun.serve (also behind the dev server on Bun) drops custom status text: https://github.com/oven-sh/bun/issues/13817
+          statusText:
+            /deno|bun/.test(ctx.preset) || (ctx.isDev && isBun)
+              ? "Service Unavailable"
+              : /aws/.test(ctx.preset)
+                ? ""
+                : "Custom Status Text",
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "x-custom-error": "custom-value",
+          },
+          data: {
+            error: true,
+            status: 503,
+            statusText: "Custom Status Text",
+            message: "Handled error",
+            data: { custom: "data" },
+            custom: "body",
+          },
+        });
+      });
+
+      it(`unhandled errors (${errorAction})`, async () => {
+        const stderrMock = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        const consoleErrorMock = vi.spyOn(console, "error").mockImplementation(() => {});
+        let res;
+        try {
+          res = await callHandler({
+            url: `/errors/throw?unhandled&action=${errorAction}`,
+            headers: { Accept: "application/json" },
+          });
+        } finally {
+          stderrMock.mockRestore();
+          consoleErrorMock.mockRestore();
+        }
+        // TODO
+        // expect(consoleErrorMock).toHaveBeenCalledExactlyOnceWith(
+        //   expect.stringContaining("Unhandled error")
+        // );
+        if (!ctx.isDev) {
+          // Prod
+          expect(res).toMatchObject({
+            status: 500,
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+            },
+            data: {
+              error: true,
+              unhandled: true,
+              status: 500,
+            },
+          });
+        } else {
+          // Dev
+          expect(res).toMatchObject({
+            status: 500,
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+            },
+            data: {
+              error: true,
+              unhandled: true,
+              status: 500,
+              message: "HTTPError",
+              stack: expect.arrayContaining(["Unhandled error"]),
+            },
+          });
+        }
+      });
+    }
+  });
+
+  describe("async context", () => {
+    it.skipIf(!ctx.fastnode!.options.node)("works", async () => {
+      const { data } = await callHandler({ url: "/context?foo" });
+      expect(data).toMatchObject({
+        context: {
+          path: "/context?foo",
+        },
+      });
+    });
+  });
+
+  describe("environment variables", () => {
+    it("can load environment variables from runtimeConfig", async () => {
+      const { data } = await callHandler({ url: "/config" });
+      expect(data.runtimeConfig.hello).toBe("world");
+      expect(data.runtimeConfig.helloThere).toBe("general");
+      expect(data.runtimeConfig.secret).toBeUndefined();
+    });
+  });
+
+  describe("cache", () => {
+    it.skipIf(isWindows && ctx.preset === "fastnode-dev")(
+      "should setItem before returning response the first time",
+      async () => {
+        const {
+          data: { timestamp },
+        } = await callHandler({ url: "/api/cached" });
+
+        // TODO
+        // expect(eventContextCache?.options.swr).toBe(true);
+
+        const calls = await Promise.all([
+          callHandler({ url: "/api/cached" }),
+          callHandler({ url: "/api/cached" }),
+          callHandler({ url: "/api/cached" }),
+        ]);
+
+        for (const call of calls) {
+          expect(call.data.timestamp).toBe(timestamp);
+          // TODO
+          // expect(call.data.eventContextCache.options.swr).toBe(true);
+        }
+      }
+    );
+  });
+
+  describe("scanned files", () => {
+    it("Allow having extra method in file name", async () => {
+      expect((await callHandler({ url: "/api/methods/get" })).data).toBe("get");
+      expect((await callHandler({ url: "/api/methods/foo.get" })).data).toBe("foo.get");
+    });
+
+    it("Matches the QUERY method suffix", async () => {
+      expect((await callHandler({ url: "/api/methods/search", method: "QUERY" })).data).toBe(
+        "query"
+      );
+      expect((await callHandler({ url: "/api/methods/search" })).data).toBe("get");
+    });
+
+    it("Falls back to the GET route for HEAD requests", async () => {
+      const fallback = await callHandler({ url: "/api/methods/search", method: "HEAD" });
+      expect(fallback.status).toBe(200);
+      expect(fallback.data || "").toBe("");
+      const get = await callHandler({ url: "/api/methods/head" });
+      expect(get.headers["x-handler"]).toBe("get");
+      const head = await callHandler({ url: "/api/methods/head", method: "HEAD" });
+      expect(head.headers["x-handler"]).toBe("head");
+    });
+
+    it("Runs GET-scoped middleware for HEAD requests", async () => {
+      for (const method of ["GET", "HEAD"]) {
+        const denied = await callHandler({ url: "/api/methods/guarded", method });
+        expect(denied.status, method).toBe(401);
+        expect(denied.headers["x-handler"], method).toBeUndefined();
+        const allowed = await callHandler({
+          url: "/api/methods/guarded",
+          method,
+          headers: { authorization: "token" },
+        });
+        expect(allowed.status, method).toBe(200);
+        expect(allowed.headers["x-handler"], method).toBe("get");
+      }
+    });
+  });
+
+  describe.skipIf(ctx.preset === "cloudflare-worker")("wasm", () => {
+    it("dynamic import wasm", async () => {
+      expect((await callHandler({ url: "/wasm/dynamic-import" })).data).toBe("2+3=5");
+    });
+
+    it("static import wasm", async () => {
+      expect((await callHandler({ url: "/wasm/static-import" })).data).toBe("2+3=5");
+    });
+  });
+
+  describe.skipIf(
+    isWindows ||
+      !ctx.fastnode!.options.node ||
+      ctx.isLambda ||
+      ctx.isWorker ||
+      ["bun", "deno-server", "netlify", "netlify-legacy"].includes(ctx.preset)
+  )("Database", () => {
+    it("works", async () => {
+      const { data } = await callHandler({ url: "/api/db" });
+      expect(data).toMatchObject({
+        rows: [
+          {
+            id: "1001",
+            firstName: "John",
+            lastName: "Doe",
+            email: "",
+          },
+        ],
+      });
+    });
+  });
+
+  describe("Environment specific routes", () => {
+    it("filters based on dev|prod", async () => {
+      const { data } = await callHandler({ url: "/env" });
+      expect(data).toBe(ctx.isDev ? "dev env" : "prod env");
+    });
+  });
+
+  it("raw imports", async () => {
+    const { data } = await callHandler({ url: "/raw" });
+    expect(data).toMatchObject({
+      sql: "--",
+      sqlts: "--",
+      json: { isString: true, text: '{\n  "foo": "bar"\n}' },
+      // Virtual modules are inlined from their rendered source, not read from disk
+      virtual: { isString: true, hasFlag: true, isUint8Array: true, bytesHaveFlag: true },
+    });
+  });
+
+  it("import attributes (bytes and text)", async () => {
+    const textAsset = "this is an asset from a text file from fastnode";
+    const { data } = await callHandler({ url: "/import-attributes" });
+    expect(data).toMatchObject({
+      bin: {
+        isUint8Array: true,
+        bytes: Array.from({ length: 256 }, (_, i) => i).join(","),
+      },
+      sql: { isUint8Array: true, text: "--" },
+      json: { isString: true, text: '{\n  "foo": "bar"\n}' },
+      txtBytes: { isUint8Array: true, text: textAsset },
+      txt: { isString: true, text: textAsset },
+      replacements: {
+        isString: true,
+        text: "This file must keep import.meta.dev, import.meta.preset and import.meta.baseURL verbatim.",
+      },
+      reexported: {
+        isString: true,
+        text: textAsset,
+        isUint8Array: true,
+        bytesText: textAsset,
+      },
+      // Source files imported as text keep their contents (attribute syntax is not rewritten)
+      source: { verbatim: true, rewritten: false },
+      commented: { isString: true, text: textAsset },
+    });
+  });
+
+  it.skipIf(
+    process.env.OFFLINE /* connect */ ||
+      ["cloudflare-worker", "cloudflare-module-legacy"].includes(ctx.preset)
+  )("nodejs compatibility", async () => {
+    const { data, status } = await callHandler({ url: "/node-compat" });
+    expect(status).toBe(200);
+    for (const key in data) {
+      if (ctx.preset === "deno-server" && key === "globals:BroadcastChannel") {
+        continue; // unstable API
+      }
+      if (
+        ctx.preset.includes("cloudflare") &&
+        key.startsWith("globals:") &&
+        ctx.fastnode!.options.builder === "rolldown"
+      ) {
+        continue;
+      }
+      expect(data[key], key).toBe(true);
+    }
+  });
+}

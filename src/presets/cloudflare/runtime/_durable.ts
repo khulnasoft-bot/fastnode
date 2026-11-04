@@ -1,0 +1,78 @@
+import { DurableObject } from "cloudflare:workers";
+import wsAdapter from "crossws/adapters/cloudflare";
+import { augmentReq } from "./_module-handler.ts";
+
+import { useFastnodeApp, useFastnodeHooks } from "fastnode/app";
+import { afterFastnodeReady } from "#fastnode/runtime/async-plugins";
+import { resolveWebsocketHooks } from "#fastnode/runtime/app";
+
+const DURABLE_BINDING = "$DurableObject";
+const DURABLE_INSTANCE = "server";
+
+const fastnodeApp = useFastnodeApp();
+const fastnodeHooks = useFastnodeHooks();
+
+// Upgrades are forwarded to the Durable Object when its binding is declared
+// https://crossws.h3.dev/adapters/cloudflare#durable-objects
+export const ws = import.meta._websocket
+  ? wsAdapter({
+      resolve: resolveWebsocketHooks,
+      instanceName: DURABLE_INSTANCE,
+      bindingName: DURABLE_BINDING,
+    })
+  : undefined;
+
+export class $DurableObject extends DurableObject {
+  constructor(state: DurableObjectState, env: Record<string, any>) {
+    super(state, env);
+    state.waitUntil(
+      afterFastnodeReady(fastnodeApp, () =>
+        fastnodeHooks.callHook("cloudflare:durable:init", this, {
+          state,
+          env,
+        })
+      ) || Promise.resolve()
+    );
+    if (import.meta._websocket) {
+      ws!.handleDurableInit(this, state, env);
+    }
+  }
+
+  override fetch(request: Request) {
+    augmentReq(request, {
+      env: this.env as any,
+      context: this.ctx as any,
+    });
+
+    if (import.meta._websocket && request.headers.get("upgrade") === "websocket") {
+      return ws!.handleDurableUpgrade(this, request);
+    }
+
+    return fastnodeApp.fetch(request);
+  }
+
+  override alarm(): void | Promise<void> {
+    this.ctx.waitUntil(
+      afterFastnodeReady(fastnodeApp, () =>
+        fastnodeHooks.callHook("cloudflare:durable:alarm", this)
+      ) || Promise.resolve()
+    );
+  }
+
+  override async webSocketMessage(client: WebSocket, message: ArrayBuffer | string) {
+    if (import.meta._websocket) {
+      return ws!.handleDurableMessage(this, client, message);
+    }
+  }
+
+  override async webSocketClose(
+    client: WebSocket,
+    code: number,
+    reason: string,
+    wasClean: boolean
+  ) {
+    if (import.meta._websocket) {
+      return ws!.handleDurableClose(this, client, code, reason, wasClean);
+    }
+  }
+}

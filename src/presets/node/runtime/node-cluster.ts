@@ -1,0 +1,71 @@
+import "#fastnode/virtual/polyfills";
+import cluster from "node:cluster";
+import { NodeRequest, serve } from "srvx/node";
+import wsAdapter from "crossws/adapters/node";
+
+import { useFastnodeApp } from "fastnode/app";
+import { startScheduleRunner } from "#fastnode/runtime/task";
+import { trapUnhandledErrors } from "#fastnode/runtime/error/hooks";
+import { resolveWebsocketHooks } from "#fastnode/runtime/app";
+import { resolveServeOptions } from "#fastnode/runtime/serve";
+import { setupCloseHooks } from "#fastnode/runtime/shutdown";
+
+const clusterId = cluster.isWorker && process.env.WORKER_ID;
+if (clusterId) {
+  console.log(`Worker #${clusterId} started`);
+}
+
+const fastnodeApp = useFastnodeApp();
+
+const silent = !!clusterId && clusterId !== "1";
+
+const server = serve(
+  resolveServeOptions({
+    fetch: fastnodeApp.fetch,
+    node: { exclusive: false },
+    ...(silent ? { silent: true } : {}),
+  })
+);
+
+// srvx only sets `process.exitCode` on listen errors; the IPC channel and other handles would keep the worker alive.
+server.ready().catch((error) => {
+  if (!silent) {
+    console.error("[fastnode] Failed to start server:", error);
+  }
+  process.exit(1);
+});
+
+if (import.meta._websocket) {
+  const { handleUpgrade } = wsAdapter({ resolve: resolveWebsocketHooks });
+  server.node!.server!.on("upgrade", (req, socket, head) => {
+    handleUpgrade(
+      req,
+      socket,
+      head,
+      // @ts-expect-error (upgrade is not typed)
+      new NodeRequest({ req, upgrade: { socket, head } })
+    );
+  });
+}
+
+setupCloseHooks(server);
+
+// The IPC channel keeps a worker alive after its server closed; disconnect so it exits.
+if (cluster.isWorker) {
+  const closeServer = server.close.bind(server);
+  server.close = (closeActiveConnections?: boolean) =>
+    closeServer(closeActiveConnections).finally(() => {
+      if (cluster.worker?.isConnected()) {
+        cluster.worker.disconnect();
+      }
+    });
+}
+
+trapUnhandledErrors();
+
+// Scheduled tasks
+if (import.meta._tasks) {
+  startScheduleRunner({ waitUntil: server.waitUntil });
+}
+
+export default {};

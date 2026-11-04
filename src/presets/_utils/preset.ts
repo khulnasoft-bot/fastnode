@@ -1,0 +1,14 @@
+import type { FastnodePreset, FastnodePresetMeta } from "fastnode/types";
+
+import { presetsDir } from "#fastnode/meta";
+import { resolve } from "node:path";
+
+export function defineFastnodePreset<P extends FastnodePreset, M extends FastnodePresetMeta>(
+  preset: P,
+  meta?: M
+): P & { _meta: FastnodePresetMeta } {
+  if (typeof preset !== "function" && preset.entry && preset.entry.startsWith(".")) {
+    preset.entry = resolve(presetsDir, preset.entry);
+  }
+  return { ...preset, _meta: meta } as P & { _meta: M };
+}

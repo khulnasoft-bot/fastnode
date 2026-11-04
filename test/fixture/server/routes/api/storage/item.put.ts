@@ -1,0 +1,11 @@
+import { defineHandler } from "fastnode/h3";
+import { useKV } from "fastnode/kv";
+
+export default defineHandler(async (event) => {
+  const base = event.url.searchParams.get("base") || "";
+  const key = event.url.searchParams.get("key") || "";
+  const storage = useKV(`test:${base}`);
+  const value = await event.req.text();
+  await storage.setItem(key, value);
+  return value;
+});

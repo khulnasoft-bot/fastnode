@@ -1,0 +1,14 @@
+{
+  "type": "module",
+  "scripts": {
+    "dev": "fastnode dev",
+    "build": "fastnode build"
+  },
+  "dependencies": {
+    "db0": "^0.4.2"
+  },
+  "devDependencies": {
+    "fastnode": "latest",
+    "rolldown": "latest"
+  }
+}

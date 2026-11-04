@@ -1,0 +1,14 @@
+{
+  "name": "fastnode-test-fixture",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "fastnode build",
+    "preview": "fastnode preview",
+    "dev": "fastnode dev"
+  },
+  "devDependencies": {
+    "fastnode": "workspace:*",
+    "mono-jsx": "latest"
+  }
+}

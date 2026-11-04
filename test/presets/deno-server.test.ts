@@ -1,0 +1,40 @@
+import { execa, execaSync } from "execa";
+import { getRandomPort } from "get-port-please";
+import { describe } from "vitest";
+import { setupTest, testFastnode } from "../tests.ts";
+import { testCloseHook } from "./_close-hook.ts";
+import { waitForServer } from "./_wait-for-server.ts";
+import { testUnixSocket } from "./_unix-socket.ts";
+
+const hasDeno = execaSync("deno", ["--version"], { stdio: "ignore", reject: false }).exitCode === 0;
+
+describe.runIf(hasDeno)("fastnode:preset:deno-server", async () => {
+  const ctx = await setupTest("deno-server");
+  testFastnode(ctx, async () => {
+    const port = await getRandomPort();
+    const p = execa("deno", ["task", "start"], {
+      cwd: ctx.outDir,
+      stdio: process.env.TEST_DEBUG ? "inherit" : "ignore",
+      reject: false,
+      env: {
+        FASTNODE_PORT: String(port),
+        FASTNODE_HOST: "127.0.0.1",
+      },
+    });
+    ctx.server = {
+      url: `http://127.0.0.1:${port}`,
+      close: async () => {
+        p.kill();
+      },
+    } as any;
+    await waitForServer(`http://127.0.0.1:${port}/`, p.nodeChildProcess);
+    return async ({ url, ...opts }) => {
+      const res = await ctx.fetch(url, opts);
+      return res;
+    };
+  });
+
+  testCloseHook(ctx, { command: "deno", args: (entry) => ["run", "-A", entry] });
+
+  testUnixSocket(ctx, { command: "deno", args: (entry) => ["run", "-A", entry] });
+});

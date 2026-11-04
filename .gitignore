@@ -1,0 +1,83 @@
+# Dependencies
+node_modules
+jspm_packages
+
+# Fastnode
+fastnode.d.ts
+.fastnode
+.data
+
+package-lock.json
+
+# Logs
+*.log
+
+# Temp directories
+.temp
+.tmp
+.cache
+
+# Generated dirs
+dist
+.nuxt
+.output
+.gen
+.tmp
+nuxt.d.ts
+
+# Junit reports
+reports
+
+# Coverage reports
+coverage
+*.lcov
+.nyc_output
+
+# VSCode
+.vscode
+
+# Intellij idea
+*.iml
+.idea
+
+# OSX
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+.vercel_build_output
+.build-*
+.env
+.netlify
+.vercel
+.amplify-hosting
+staticwebapp.config.json
+playground/firebase.json
+.zeabur
+.apphosting
+.edgeone
+
+test/fixture/functions
+.data
+
+.pnpm-store
+.wrangler
+
+CHANGELOG.md
+RELEASE_NOTES.md

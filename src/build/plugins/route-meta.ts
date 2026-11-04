@@ -1,0 +1,124 @@
+import { readFileSync } from "node:fs";
+import { isAbsolute } from "pathe";
+import type { Expression, Literal } from "estree";
+import type { Fastnode, FastnodeEventHandler } from "fastnode/types";
+import type { Plugin } from "rollup";
+import type { Plugin as VitePlugin } from "vite";
+import { viteDepPaths } from "../builders/vite/_import.ts";
+import { importOXC } from "../../utils/oxc.ts";
+import { escapeRegExp } from "../../utils/regex.ts";
+import { chain } from "../../utils/sync.ts";
+
+const PREFIX = "\0fastnode:route-meta:";
+
+export async function routeMeta(fastnode: Fastnode) {
+  let oxc = await importOXC({ dir: fastnode.options.rootDir, paths: viteDepPaths(fastnode) });
+  return {
+    name: "fastnode:route-meta",
+    // With `fastnode/vite`, the running `vite` is only known once its config is resolved
+    // (Vite only runs `buildStart` of the `client` environment in dev by default)
+    perEnvironmentStartEndDuringDev: true,
+    async buildStart() {
+      oxc = await importOXC({ dir: fastnode.options.rootDir, paths: viteDepPaths(fastnode) });
+    },
+    resolveId: {
+      order: "pre",
+      // eslint-disable-next-line no-control-regex
+      filter: { id: /^(?!\u0000)(.+)\?meta$/ },
+      handler(id, importer, resolveOpts) {
+        if (id.endsWith("?meta")) {
+          return chain(this.resolve(id.replace("?meta", ""), importer, resolveOpts), (resolved) =>
+            resolved ? PREFIX + resolved.id : undefined
+          );
+        }
+        return undefined;
+      },
+    },
+    load: {
+      order: "pre",
+      filter: {
+        id: new RegExp(`^${escapeRegExp(PREFIX)}`),
+      },
+      handler(id) {
+        if (id.startsWith(PREFIX)) {
+          const fullPath = id.slice(PREFIX.length);
+          if (isAbsolute(fullPath)) {
+            return readFileSync(fullPath, "utf8");
+          } else {
+            return "export default undefined;";
+          }
+        }
+        return undefined;
+      },
+    },
+    transform: {
+      order: "pre",
+      filter: {
+        id: new RegExp(`^${escapeRegExp(PREFIX)}`),
+      },
+      handler(code, id) {
+        const { parseSync, transformSync } = oxc;
+        let meta: FastnodeEventHandler["meta"] | null = null;
+
+        try {
+          const transformRes = transformSync(id, code, { tsconfig: false });
+          if (transformRes.errors?.length > 0) {
+            for (const error of transformRes.errors) {
+              this.warn(error);
+            }
+            return {
+              code: `export default {};`,
+              map: null,
+              moduleType: "js",
+            };
+          }
+
+          // Not `this.parse()`, so the plugin also runs without a bundler (`builder: false`)
+          const { program } = parseSync(id, transformRes.code, { lang: "js" });
+          for (const node of program.body as any[]) {
+            if (
+              node.type === "ExpressionStatement" &&
+              node.expression.type === "CallExpression" &&
+              node.expression.callee.type === "Identifier" &&
+              node.expression.callee.name === "defineRouteMeta" &&
+              node.expression.arguments.length === 1
+            ) {
+              meta = astToObject(node.expression.arguments[0] as any);
+              break;
+            }
+          }
+        } catch (error) {
+          fastnode.logger.warn(`[handlers-meta] Cannot extra route meta for: ${id}: ${error}`);
+        }
+
+        return {
+          code: `export default ${JSON.stringify(meta)};`,
+          map: null,
+          moduleType: "js",
+        };
+      },
+    },
+  } satisfies Plugin & Pick<VitePlugin, "perEnvironmentStartEndDuringDev">;
+}
+
+function astToObject(node: Expression | Literal): any {
+  switch (node.type) {
+    case "ObjectExpression": {
+      const obj: Record<string, any> = {};
+      for (const prop of node.properties) {
+        if (prop.type === "Property") {
+          const key = (prop.key as any).name ?? (prop.key as any).value;
+          obj[key] = astToObject(prop.value as any);
+        }
+      }
+      return obj;
+    }
+    case "ArrayExpression": {
+      return node.elements.map((el) => astToObject(el as any)).filter((obj) => obj !== undefined);
+    }
+    case "Literal": {
+      return node.value;
+    }
+    // No default
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "type": "module",
+  "scripts": {
+    "dev": "fastnode dev",
+    "build": "fastnode build"
+  },
+  "devDependencies": {
+    "fastnode": "latest",
+    "mono-jsx": "latest",
+    "rolldown": "latest"
+  }
+}

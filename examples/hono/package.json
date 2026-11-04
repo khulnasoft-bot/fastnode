@@ -1,0 +1,12 @@
+{
+  "type": "module",
+  "scripts": {
+    "build": "fastnode build",
+    "dev": "fastnode dev"
+  },
+  "devDependencies": {
+    "fastnode": "latest",
+    "hono": "^4.13.14",
+    "rolldown": "latest"
+  }
+}

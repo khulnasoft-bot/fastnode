@@ -1,0 +1,29 @@
+{
+  "extends": "./lib/tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowSyntheticDefaultImports": true,
+    "erasableSyntaxOnly": true,
+    "strict": true,
+    "noImplicitReturns": true,
+    "jsx": "preserve",
+    "lib": ["es2022", "webworker", "dom.iterable"],
+    "types": ["node", "@cloudflare/workers-types/experimental"]
+  },
+  "exclude": [
+    "examples/import-alias/**",
+    "examples/vite-rsc/**",
+    "examples/vite-ssr-solidstart/**",
+    "test/fixture/server/routes/jsx.tsx",
+    "test/vite/alias-precedence-fixture/server.ts",
+    "test/vite/tsconfig-paths-fixture/server.ts",
+    "test/unbundled/fixture/**",
+    "examples/vite-ssr-html/vite.config.ts",
+    "examples/vite-ssr-solid/src/entry-server.tsx",
+    "examples/vite-ssr-solid/src/entry-client.tsx",
+    "examples/express/server.node.ts",
+    "examples/vite-ssr-react-router/**",
+    "test/**/dist"
+  ]
+}

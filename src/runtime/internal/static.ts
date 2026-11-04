@@ -1,0 +1,123 @@
+import { HTTPError, defineHandler } from "h3";
+import type { EventHandler, HTTPMethod } from "h3";
+import type { PublicAsset } from "fastnode/types";
+import { decodePath, joinURL, withLeadingSlash, withoutTrailingSlash } from "ufo";
+import { getAsset, hasAsset, isPublicAssetURL, readAsset } from "#fastnode/virtual/public-assets";
+
+const METHODS = new Set(["HEAD", "GET"] as HTTPMethod[]);
+
+const EncodingMap = { gzip: ".gz", br: ".br", zstd: ".zst" } as const;
+
+// Opts missing assets out of the immutable `cache-control` route rule of asset dirs (h3js/h3#1612)
+const noCacheHeaders = { "cache-control": "no-store" };
+
+export default defineHandler((event) => {
+  if (event.req.method && !METHODS.has(event.req.method as HTTPMethod)) {
+    return;
+  }
+
+  const path = withLeadingSlash(withoutTrailingSlash(event.url.pathname));
+  let id = path.includes("%") ? decodePath(path) : path;
+
+  // Most requests are not for public assets: skip the encoding negotiation for them
+  if (!hasAsset(id) && !hasAsset(joinURL(id, "index.html")) && !isPublicAssetURL(id)) {
+    return;
+  }
+
+  let asset: PublicAsset | undefined;
+
+  const encodingHeader = event.req.headers.get("accept-encoding") || "";
+  const encodings = [
+    ...encodingHeader
+      .split(",")
+      .map((entry) => {
+        const [name, ...parameters] = entry.split(";");
+        const quality = parameters
+          .map((parameter) => parameter.trim().split("="))
+          .find(([key]) => key!.toLowerCase() === "q")?.[1];
+        const weight = quality === undefined ? 1 : Number.parseFloat(quality);
+        return {
+          ext: EncodingMap[name!.trim().toLowerCase() as keyof typeof EncodingMap],
+          // An unparsable weight is an invalid parameter, not a rejection
+          weight: Number.isNaN(weight) ? 1 : weight,
+        };
+      })
+      // `q=0` means "not acceptable" (RFC 9110 12.4.2)
+      .filter((entry) => entry.ext && entry.weight > 0)
+      // Highest client weight wins, then our own (alphabetical) preference
+      .sort((a, b) => b.weight - a.weight || (a.ext < b.ext ? -1 : a.ext > b.ext ? 1 : 0))
+      .map((entry) => entry.ext),
+    "",
+  ];
+
+  for (const encoding of encodings) {
+    for (const _id of [id + encoding, joinURL(id, "index.html" + encoding)]) {
+      const _asset = getAsset(_id);
+      if (_asset) {
+        asset = _asset;
+        id = _id;
+        break;
+      }
+    }
+  }
+
+  if (!asset) {
+    if (isPublicAssetURL(id)) {
+      throw new HTTPError({ status: 404, headers: noCacheHeaders });
+    }
+    return;
+  }
+
+  if (encodings.length > 1) {
+    event.res.headers.append("Vary", "Accept-Encoding");
+  }
+
+  const ifNotMatch = event.req.headers.get("if-none-match") === asset.etag;
+  if (ifNotMatch) {
+    event.res.status = 304;
+    event.res.statusText = "Not Modified";
+    return "";
+  }
+
+  const ifModifiedSinceH = event.req.headers.get("if-modified-since");
+  const mtimeDate = new Date(asset.mtime);
+  if (ifModifiedSinceH && asset.mtime && new Date(ifModifiedSinceH) >= mtimeDate) {
+    event.res.status = 304;
+    event.res.statusText = "Not Modified";
+    return "";
+  }
+
+  if (asset.type) {
+    event.res.headers.set("Content-Type", asset.type);
+  }
+
+  if (asset.etag && !event.res.headers.has("ETag")) {
+    event.res.headers.set("ETag", asset.etag);
+  }
+
+  if (asset.mtime && !event.res.headers.has("Last-Modified")) {
+    event.res.headers.set("Last-Modified", mtimeDate.toUTCString());
+  }
+
+  if (asset.encoding && !event.res.headers.has("Content-Encoding")) {
+    event.res.headers.set("Content-Encoding", asset.encoding);
+  }
+
+  if (asset.size > 0 && !event.res.headers.has("Content-Length")) {
+    event.res.headers.set("Content-Length", asset.size.toString());
+  }
+
+  const data = readAsset(id);
+  return typeof (data as { then?: unknown })?.then === "function"
+    ? (data as Promise<unknown>).then((resolved) => assertAssetData(resolved))
+    : assertAssetData(data);
+}) as EventHandler;
+
+// Readers resolve with `null`/`undefined` when the manifest entry has no data
+// backing it (file removed after build, missing inline payload).
+function assertAssetData<T>(data: T): T {
+  if (data === null || data === undefined) {
+    throw new HTTPError({ status: 404, headers: noCacheHeaders });
+  }
+  return data;
+}

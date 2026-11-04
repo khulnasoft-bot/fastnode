@@ -1,0 +1,12 @@
+{
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "fastnode": "latest",
+    "shiki": "latest",
+    "vite": "latest"
+  }
+}

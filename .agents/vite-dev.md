@@ -1,0 +1,232 @@
+# Vite Dev Middleware — Request Routing
+
+> Scope: the request-routing logic in `src/build/builders/vite/dev.ts` — the two
+> `server.middlewares.use(...)` registrations (`fastnodeDevMiddlewarePre` and the
+> catch-all `fastnodeDevMiddleware`): why the current design looks the way it does.
+
+## 1. Where it lives & how it is wired
+
+- Logic: `src/build/builders/vite/dev.ts` → `configureViteDevServer(ctx, server)`.
+- Entry: `src/build/builders/vite/plugin.ts:266` — the plugin's `configureServer` hook
+  `return`s the result of `configureViteDevServer`.
+
+Vite's `configureServer` contract: middleware registered **synchronously**
+inside the hook runs **before** Vite's internal middlewares; a function
+**returned** from the hook runs **after** them (the "post" hook). Fastnode uses
+both ends:
+
+| Registration | Site | Runs | Role |
+|---|---|---|---|
+| `fastnodeDevMiddlewarePre` (`const` form) | `dev.ts:284` | **before** Vite static/transform | Classifier. Route explicit-Fastnode + definite navigations to Fastnode immediately; let definite assets fall through to Vite, marking them `_fastnodeHandled` (transparent catch-all) or `_fastnodeAssetCheck` (opaque catch-all / no match). |
+| `fastnodeDevMiddleware` | defined at `dev.ts:213`, registered inside the returned `() => { ... }` | **after** Vite static/transform | Catch-all fallback. Wraps req as web `Request`, tries `ctx.devApp.fetch` then `fastnodeEnv.dispatchFetch`, honoring `baseURL`; inspects the response for `_fastnodeAssetCheck` requests. Skipped for `_fastnodeHandled`. |
+
+**Why two, and why pre?** Without the pre-pass, Vite's static/transform
+middleware serves files from the project root and would answer server routes
+before Fastnode sees them (see upstream **vitejs/vite#20866**, which made Vite
+consult `sec-fetch-dest` to let document requests fall through — the same
+header Fastnode's classifier leans on).
+
+Facts about Vite's side (verified against vite@8.1.4): Fastnode defaults
+`appType` to `"custom"` (`plugin.ts:199` — user-overridable; the reasoning
+below assumes the default), so Vite registers none of
+`htmlFallback`/`indexHtml`/`notFound` middlewares, and **every plain miss
+`next()`s** (sirv and transformMiddleware never self-emit a 404 for a missing
+file/module). The only terminal 404 is connect's `finalhandler`, which sits
+**after** the Fastnode post-hook. So Vite genuinely hands off every request it
+cannot serve — the post catch-all is the last handler before `finalhandler`.
+
+## 2. Classification
+
+`fastnode.routing.routes` in an SSR app **always** contains a catch-all `/**`, so
+"does a Fastnode route match?" is nearly always *yes*. The design distinguishes:
+
+- **Explicit route** — `route` set, `!== "/**"`, not `startsWith("/**:")` (a
+  prefixed splat like `/api/photos/**` is explicit). Deterministic → **always
+  Fastnode**, no heuristic may override (#4108, #4241, #4252, #4270).
+- **Explicit dev app route** — `FastnodeDevApp.hasRoute()`: a `devHandlers` route,
+  a `devProxy` route, or a public-asset dir under a non-root `baseURL` with
+  `fallthrough: false` (paths below the dir, not the dir itself, same as
+  production). Root catch-alls are skipped. Marked `_fastnodeDevRoute` → Fastnode,
+  and the dev app's response (even a 404) is final.
+- **Transparent catch-all** — a *user route file* at root level
+  (`routes/[...].ts` → `/**`, `routes/[...slug].ts` → `/**:slug`). Fastnode sees
+  everything it can handle, so Vite stays the definitive asset handler: an
+  asset-tagged request is marked `_fastnodeHandled` and a Vite miss must **not**
+  fall back into it (#4234/#4266).
+- **Opaque catch-all** — any root catch-all that is not a scanned route file:
+  the SSR renderer `/**`, a custom `serverEntry` `/**`, or a `/**` registered
+  through `routes:` / `handlers:` config or a module (#4531). Their *real*
+  routes are invisible to the host (`server.ts` H3 app routes, framework
+  routers like TanStack Start, handlers generating assets), so an asset-tagged
+  miss from Vite must still be **dispatched** — marked `_fastnodeAssetCheck`,
+  decided by response inspection.
+- **None** — no match. Extensionless → page navigation → Fastnode; asset-tagged →
+  same as opaque (`_fastnodeAssetCheck`, dispatch after Vite).
+
+## 3. The asset heuristic (catch-all / none case only)
+
+Set `Vary: sec-fetch-dest, accept`, then:
+
+- **`Sec-Fetch-Dest` present & concrete** (not `empty`): `document`/`iframe`/
+  `frame` = navigation → Fastnode; anything else (`image`, `video`, `style`, …) =
+  asset.
+- **Absent or `empty`**: a Vite `?import` module-graph marker
+  (`/[?&]import(?:[&=]|$)/` on the URL) ⇒ asset — only Vite's module graph emits
+  it, never a page navigation, so it stays authoritative for extensions left out
+  of `ASSET_EXT_RE` like imported `.json` (#4433). Otherwise fall back to
+  extension — `ASSET_EXT_RE.test(ext)` **and** no `text/html` in `Accept` ⇒
+  asset. (`empty` = fetch/XHR is ambiguous: it tags both API calls and
+  `fetch()`ed assets.) Last resort: the path resolves to a real file under
+  the Vite project root ⇒ asset — `?url` imports compile to a bare
+  root-relative fetch with no marker and any extension (#4230), and a real
+  root file is exactly what `serveStaticMiddleware` serves, so it mirrors its
+  skip rules (`.html` excluded, same `Accept: text/html` guard). The probe is
+  confined to the root so `%2e%2e` paths can't reveal outside files.
+- **Only `GET`/`HEAD` can be assets at all** — a `POST /upload.png` is never a
+  browser asset load, so other methods bypass the heuristic entirely.
+- Non-asset + (matched or extensionless) → Fastnode immediately (pre-Vite).
+
+Two regexes to keep intact:
+- `ASSET_EXT_RE` (`dev.ts:24`) — narrow on purpose, so dotted Fastnode params like
+  `/foo.bar.1` still reach Fastnode (#4108).
+- Extension is extracted from the path only (query/hash stripped) so
+  `?file=bar.png` does not misclassify.
+
+## 4. Response inspection (`_fastnodeAssetCheck`)
+
+An asset-tagged request that only an opaque catch-all could handle cannot be
+classified **a priori** — `/image.png` may be a real custom-entry route (#4252)
+or a genuinely missing asset that a naive SSR `/**` would render as a 200 page
+(#4234). It *can* be classified from the **response**: after Vite declines and
+the post catch-all dispatches to Fastnode, a 2xx with a `text/html` content-type
+(inline check in the post middleware) means the catch-all rendered a page for a
+missing asset → the response is discarded via `next()` (connect `finalhandler`
+404, same as before). Anything else — real asset types, JSON, `text/plain`, no
+content-type, non-2xx (framework 404 pages, redirects) — passes through
+verbatim.
+
+Deny-list rationale (all verified empirically):
+
+- Only `text/html` counts as a swallow. `application/json` was originally
+  denied too, but that broke real opaque frameworks: TanStack Start answers
+  API routes tagged as asset loads with JSON on purpose
+  (`<img src="/api/.../thumbnail">`, TanStack/router#7403, fastnode PR #4274),
+  and sourcemaps (`.map` ∈ `ASSET_EXT_RE`) are legitimately JSON. The
+  accepted trade-off: an SSR entry that swallows missing assets with *JSON*
+  (pathological — real naive SSR renders HTML) now returns 200 JSON instead
+  of 404 in dev.
+- `text/plain` is excluded because a bare string returned from an h3 handler
+  has **no** content-type at the h3 layer but arrives as `text/plain;
+  charset=UTF-8` — srvx's node-adapter default applied on the worker's HTTP hop
+  (`srvx/dist/adapters/node.mjs`; runner-dependent but converges) — and must
+  pass through (custom-entry handlers returning strings).
+- Transparent (user-file) catch-alls can **not** use inspection instead of the
+  divert: their string 200s arrive with no distinguishing content-type.
+
+This keeps everything zero-config, host-side only (no runtime/bundle change,
+no production behavior change). Known leftovers:
+
+- **Production** SSR still renders 200 HTML for missing-asset URLs —
+  pre-existing behavior; changing it is a separate, deliberate breaking-change
+  discussion.
+- A config-registered `/**` catch-all that answers every path with a bare
+  string (`text/plain`) 200s missing assets in dev, same as in production;
+  only scanned route files keep the transparent divert.
+- Dev-only cost: a missing asset matching an opaque catch-all triggers a full
+  (discarded) SSR render before the 404.
+
+## 5. Issue / PR lineage (chronological)
+
+- **#3649** first crude "has extension ⇒ Vite" rule; **#3804/#3805/#3817**
+  middleware improvements, mounted-path skip, internal-prefix skip (survives as
+  the `^\/(?:__|@)` guard); **#4098** `sec-websocket-protocol` to tell Vite HMR
+  sockets from Fastnode websockets (the `upgrade` handler).
+- **#4108** baseURL-aware matching for dotted Fastnode routes
+  (TanStack/router#6903).
+- **#4234** non-loopback plain-HTTP origins omit `Sec-Fetch-*` → splat swallowed
+  `<script src>` loads. Fixed by **#4238**: `Accept` + `ASSET_EXT_RE` fallback +
+  the `_fastnodeHandled` marker.
+- **#4241** #4238 over-eager: `sec-fetch-dest: image` on a real route
+  (`/api/image`) sent to Vite → 404. Fixed by `7d49dcae` + `08f2ec69`
+  (query-string stripped before extension matching).
+- **#4252 / #4270** even explicit routes lost when the URL had an asset
+  extension. Fixed by **#4272** (`5b7e152b`): explicit vs catch-all vs none
+  classification — **an explicit route is a deterministic win no heuristic can
+  touch**.
+- `7765bcb7` added `isExplicitPublicAsset`; **#4734/#4736** replaced it and the
+  pre-pass dev handler/proxy router with `FastnodeDevApp.hasRoute()` (#4735).
+- **#4252 follow-ups** (katywings, jantimon/TanStack/router#7403): routes the
+  classifier cannot see — a custom `server.ts` H3 app serving `/image.png`, or
+  an SSR framework serving assets — were pre-empted by `_fastnodeHandled` and
+  could never run. Fixed by the opaque-catch-all + response-inspection design
+  above (§2, §4): the pre-emption now applies only to transparent user-file
+  catch-alls, and opaque dispatches are judged by their response content-type.
+- **#4531** a `/**` registered via `routes:` / `handlers:` config was classified
+  transparent (only `renderer` / `serverEntry` handler paths were opaque), so a
+  catch-all generating images 404'd in dev. Now only scanned route files are
+  transparent.
+
+## 6. Runtime dispatch flow
+
+The catch-all `fastnodeDevMiddleware` dispatches in two stages:
+
+1. **`ctx.devApp.fetch(req)`** — `FastnodeDevApp` (`src/dev/app.ts`), host-side:
+   `devHandlers`, `/_vfs/**`, `/_fastnode/tasks`, public asset dirs, `devProxy`.
+   No catch-all → a 404 means "not mine, hand off" (unless `_fastnodeDevRoute`,
+   where it is final); any non-404 is returned directly (never inspected —
+   deterministic host serves are authoritative).
+2. **`fastnodeEnv.dispatchFetch(req)`** → env-runner → worker → `fastnodeApp.fetch` →
+   full route table, middleware, catch-alls.
+
+Catch-all registration (`src/routing.ts`): a custom `serverEntry` is pushed as
+`/**` with `handler = fastnode.options.serverEntry.handler`; the SSR renderer as
+`/**` with `handler = fastnode.options.renderer.handler` (set by `plugin.ts`
+`configResolved` to `internal/vite/ssr-renderer` when an `ssr` service exists).
+The pre-pass treats a matched catch-all as transparent only when its `handler`
+is in `fastnode.scannedHandlers` (a route file); everything else is opaque.
+
+## 7. Test coverage map
+
+All under `test/vite/`; run via `test:rollup` and `test:rolldown`. Each starts
+a real Vite dev server and `fetch()`es with hand-set headers.
+
+- `app.test.ts` (`app-fixture/`) — SSR `/**` path. #4234 swallow contracts
+  (missing `.css`/`.js` under `style`/absent/`empty` dests must not 200 — the
+  fixture entry renders an HTML page for extensioned misses), JSON API routes
+  under `sec-fetch-dest: image` pass through (TanStack/router#7403), #4252
+  deliberate asset serve (`/dynamic-asset.png` → `image/png` passes
+  inspection), `HTTPError` propagation, navigations, storage/config sharing.
+- `server-entry.test.ts` (`server-entry-fixture/`) — #4252 custom `server.ts`
+  H3 app: asset-extensioned routes reachable under `image`/absent/`script`
+  dests (including a no-content-type string return), JSON sourcemap
+  (`/generated.js.map`) passes through, `POST` to an asset-extensioned route
+  reaches its handler (non-GET/HEAD are never assets), missing-asset 404
+  contract, navigation.
+- `root-wildcard.test.ts` — transparent root catch-all `/**:path`: must never
+  200 for `/entry-client.ts` under `script`/`style`/`image`/absent dests
+  (#4234/#4266), navigations still reach it.
+- `config-catchall.test.ts` — opaque `routes: { "/**": ... }` catch-all
+  (#4531): generated `image/png` served under `image`/absent dests, HTML
+  answer to a missing `.js` still 404s, navigations reach it.
+- `baseurl-dotted-param.test.ts` — explicit splat routes under `baseURL:
+  /subdir/`: #4241, #4252, #4270, query-string extension, unmatched asset →
+  Vite.
+- Tangential: `hmr.test.ts` (existing module served by Vite under `script`
+  dest), `openapi.test.ts` (explicit routes), others (build/env, not routing).
+
+## 8. Gotchas
+
+- The `server.middlewares.stack` scan in `fastnodeDevMiddleware` skips requests
+  whose path matches any other middleware's mounted `base` (#3805), with connect's matching
+  (`matchesMiddlewareRoute()`: case-insensitive, path boundary, bare `use(fn)` ignored).
+- `_fastnodeHandled` is a one-way latch set by the pre-pass (transparent
+  catch-all asset) and by the post catch-all itself (re-entry guard). Never set
+  it for a request a real or opaque handler should still see (#4252 root
+  cause).
+- Extension detection must stay path-only (strip `?#`) and `ASSET_EXT_RE` must
+  stay narrow, or dotted Fastnode params regress (#4108).
+- The inspection's html-only check must not grow `text/plain` (bridge default
+  for string returns) or `application/json` (deliberate API serves, #7403), and it must only apply to `envRes.ok` — framework 404 pages
+  and redirects pass through verbatim.
+- The websocket `upgrade` handler is a separate concern sharing the "Vite's or
+  Fastnode's?" theme.

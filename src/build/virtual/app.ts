@@ -1,0 +1,225 @@
+import type { Fastnode } from "fastnode/types";
+
+export default function app(fastnode: Fastnode) {
+  return {
+    id: "#fastnode/virtual/app",
+    template: () => {
+      const hasRoutes = fastnode.routing.routes.hasRoutes();
+      const hasRouteRules = fastnode.routing.routeRules.hasRoutes();
+      const hasRoutedMiddleware = fastnode.routing.routedMiddleware.hasRoutes();
+      const hasGlobalMiddleware = fastnode.routing.globalMiddleware.length > 0;
+      const hasPlugins = fastnode.options.plugins.length > 0;
+      const hasHooks = fastnode.options.features?.runtimeHooks ?? hasPlugins;
+      const hasAsyncContext = !!fastnode.options.experimental.asyncContext;
+      const routeMethods = [
+        ...new Set(
+          fastnode.routing.routes.routes.filter((r) => r.method).map((r) => r.method.toUpperCase())
+        ),
+      ].sort();
+      const hasMethodRoutes = routeMethods.length > 0;
+
+      const routingImports = [
+        hasRoutes && "findRoute",
+        hasRoutedMiddleware && "findRoutedMiddleware",
+        hasGlobalMiddleware && "globalMiddleware",
+      ].filter(Boolean);
+
+      const imports: string[] = [];
+      const code: string[] = [];
+
+      imports.push(
+        `import { H3Core } from "h3";`,
+        `import errorHandler from "#fastnode/virtual/error-handler";`
+      );
+
+      // --- createFastnodeApp() ---
+
+      code.push(``, `export function createFastnodeApp() {`);
+
+      if (hasHooks) {
+        imports.push(`import { HookableCore } from "#fastnode/runtime/hookable";`);
+        code.push(`  const hooks = new HookableCore();`);
+      }
+
+      code.push(``, `const captureError = (error, errorCtx) => {`);
+      if (hasHooks) {
+        code.push(
+          `    const promise = hooks.callHook("error", error, errorCtx)?.catch?.((hookError) => {`,
+          `      console.error("Error while capturing another error", hookError);`,
+          `    });`
+        );
+      }
+      code.push(
+        `    if (errorCtx?.event) {`,
+        `      const errors = errorCtx.event.req.context?.fastnode?.errors;`,
+        `      if (errors) {`,
+        `        errors.push({ error, context: errorCtx });`,
+        `      }`
+      );
+      if (hasHooks) {
+        code.push(
+          `      if (promise && typeof errorCtx.event.req.waitUntil === "function") {`,
+          `        errorCtx.event.req.waitUntil(promise);`,
+          `      }`
+        );
+      }
+      code.push(`    }`, `  };`);
+
+      code.push(``, `  const h3App = createH3App({`, `    onError(error, event) {`);
+      if (hasHooks) {
+        code.push(`      captureError(error, { event });`);
+      }
+      code.push(`      return errorHandler(error, event);`, `    },`, `  });`);
+
+      if (hasHooks) {
+        code.push(
+          ``,
+          `  h3App.config.onRequest = (event) => {`,
+          `    return hooks.callHook("request", event)?.catch?.((error) => {`,
+          `      captureError(error, { event, tags: ["request"] });`,
+          `    });`,
+          `  };`,
+          `  h3App.config.onResponse = (res, event) => {`,
+          `    return hooks.callHook("response", res, event)?.catch?.((error) => {`,
+          `      captureError(error, { event, tags: ["response"] });`,
+          `    });`,
+          `  };`
+        );
+      }
+
+      code.push(
+        ``,
+        `  let appHandler = (req) => {`,
+        `    req.context ||= {};`,
+        `    req.context.fastnode = req.context.fastnode || { errors: [] };`,
+        `    return h3App.fetch(req);`,
+        `  };`
+      );
+
+      if (hasAsyncContext) {
+        imports.push(`import { fastnodeAsyncContext } from "#fastnode/runtime/context";`);
+        code.push(
+          ``,
+          `  const originalHandler = appHandler;`,
+          `  appHandler = (req) => {`,
+          `    return fastnodeAsyncContext.callAsync({ request: req }, () => originalHandler(req));`,
+          `  };`
+        );
+      }
+
+      code.push(
+        ``,
+        `  return {`,
+        `    fetch: appHandler,`,
+        `    h3: h3App,`,
+        `    hooks: ${hasHooks ? "hooks" : "undefined"},`,
+        `    captureError,`,
+        `  };`,
+        `}`
+      );
+
+      // --- initFastnodePlugins() ---
+
+      code.push(``, `export function initFastnodePlugins(app) {`);
+      if (hasPlugins) {
+        imports.push(
+          `import { plugins } from "#fastnode/virtual/plugins";`,
+          `import { initAsyncPlugins } from "#fastnode/runtime/async-plugins";`,
+          `import { h3ResetDispatcher } from "#fastnode/runtime/compatibility/h3";`
+        );
+        code.push(
+          `  for (let i = 0; i < plugins.length; i++) {`,
+          `    let result;`,
+          `    try {`,
+          `      result = plugins[i](app);`,
+          `    } catch (error) {`,
+          `      app.captureError?.(error, { tags: ["plugin"] });`,
+          `      throw error;`,
+          `    }`,
+          `    if (typeof result?.then === "function") {`,
+          `      return initAsyncPlugins(app, result, plugins.slice(i + 1));`,
+          `    }`,
+          `  }`,
+          // h3 composes `~middleware` into a dispatcher on first dispatch and
+          // never re-reads it. A plugin may have dispatched already (warm-up
+          // fetch) before a later plugin (e.g. tracing) touched the chain.
+          `  h3ResetDispatcher(app.h3);`
+        );
+      }
+      code.push(`  return app;`, `}`);
+
+      // --- createH3App() ---
+
+      if (routingImports.length) {
+        imports.push(`import { ${routingImports.join(", ")} } from "#fastnode/virtual/routing";`);
+      }
+
+      code.push(``, `function createH3App(config) {`, `  const h3App = new H3Core(config);`);
+      // `~findRoute` runs before dispatch on the original pathname, so route
+      // rules are resolved there and `event.context.routeRules` is populated for
+      // every middleware, including ones plugins unshift onto `~middleware`.
+      if (hasRoutes || hasRouteRules) {
+        code.push(`  h3App["~findRoute"] = (event) => {`);
+        if (hasRouteRules) {
+          code.push(
+            `    event.context.routeRules = getRouteRules(event.req.method, event.url.pathname).routeRules;`
+          );
+        }
+        if (hasRoutes) {
+          // `HEAD` is served by the `GET` route unless a `HEAD` route matches
+          // (a method-agnostic match, such as a catch-all, would hide the `GET` one).
+          code.push(
+            `    if (event.req.method === "HEAD") {`,
+            `      const route = findRoute("HEAD", event.url.pathname);`,
+            `      return route?.data.method ? route : findRoute("GET", event.url.pathname);`,
+            `    }`
+          );
+        }
+        code.push(
+          hasMethodRoutes
+            ? `    return findRoute(event.req.method, event.url.pathname) ?? findMethodNotAllowed(event.req.method, event.url.pathname);`
+            : hasRoutes
+              ? `    return findRoute(event.req.method, event.url.pathname);`
+              : `    return undefined;`,
+          `  };`
+        );
+      }
+      // Route rules, global, routed middleware and the `cache` rule (which
+      // dispatches the route handler itself) are registered on `~middleware`
+      // in that order so h3 precomposes the chain once on first dispatch.
+      const runtimeAppImports = [
+        hasRouteRules && "createRouteRulesMiddleware",
+        hasRoutedMiddleware && "createRoutedMiddleware",
+        hasRouteRules && "createCacheRuleMiddleware",
+        hasRouteRules && "getRouteRules",
+        hasMethodRoutes && "createMethodNotAllowedMatcher",
+      ].filter(Boolean);
+      if (runtimeAppImports.length) {
+        imports.push(`import { ${runtimeAppImports.join(", ")} } from "#fastnode/runtime/app";`);
+      }
+      if (hasRouteRules || hasGlobalMiddleware || hasRoutedMiddleware) {
+        imports.push(`import { h3PushMiddleware } from "#fastnode/runtime/compatibility/h3";`);
+      }
+      if (hasMethodRoutes) {
+        code.push(
+          `  const findMethodNotAllowed = createMethodNotAllowedMatcher(findRoute, ${JSON.stringify(routeMethods)});`
+        );
+      }
+      if (hasRouteRules) {
+        code.push(`  h3PushMiddleware(h3App, [createRouteRulesMiddleware()]);`);
+      }
+      if (hasGlobalMiddleware) {
+        code.push(`  h3PushMiddleware(h3App, globalMiddleware);`);
+      }
+      if (hasRoutedMiddleware) {
+        code.push(`  h3PushMiddleware(h3App, [createRoutedMiddleware(findRoutedMiddleware)]);`);
+      }
+      if (hasRouteRules) {
+        code.push(`  h3PushMiddleware(h3App, [createCacheRuleMiddleware()]);`);
+      }
+      code.push(`  return h3App;`, `}`);
+
+      return [...imports, ...code].join("\n");
+    },
+  };
+}

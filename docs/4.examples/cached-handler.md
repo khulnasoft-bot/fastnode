@@ -1,0 +1,97 @@
+---
+navigation:
+  category: features
+icon: i-lucide-clock
+---
+
+# Cached Handler
+
+> Cache route responses with configurable bypass logic.
+
+<!-- automd:ui-code-tree src="../../examples/cached-handler" default="server.ts" ignore="README.md,GUIDE.md" expandAll -->
+
+::code-tree{defaultValue="server.ts" expandAll}
+
+```ts [fastnode.config.ts]
+import { defineConfig } from "fastnode";
+
+export default defineConfig({});
+```
+
+```json [package.json]
+{
+  "type": "module",
+  "scripts": {
+    "dev": "fastnode dev",
+    "build": "fastnode build"
+  },
+  "devDependencies": {
+    "fastnode": "latest",
+    "rolldown": "latest"
+  }
+}
+```
+
+```ts [server.ts]
+import { html } from "fastnode";
+import { defineCachedHandler } from "fastnode/cache";
+
+export default defineCachedHandler(
+  async () => {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return html`
+      Response generated at ${new Date().toISOString()} (took 500ms)
+      <br />(<a href="?skipCache=true">skip cache</a>)
+    `;
+  },
+  { shouldBypassCache: ({ req }) => req.url.includes("skipCache=true") }
+);
+```
+
+```json [tsconfig.json]
+{
+  "extends": "fastnode/tsconfig"
+}
+```
+
+```ts [vite.config.ts]
+import { defineConfig } from "vite";
+import { fastnode } from "fastnode/vite";
+
+export default defineConfig({ plugins: [fastnode()] });
+```
+
+::
+
+<!-- /automd -->
+
+<!-- automd:file src="../../examples/cached-handler/README.md" -->
+
+This example shows how to cache an expensive operation (a 500 ms delay) and conditionally bypass the cache using a query parameter. On first request, the handler executes and caches the result. Subsequent requests return the cached response instantly until the cache expires or is bypassed.
+
+## How It Works
+
+```ts [server.ts]
+import { html } from "fastnode";
+import { defineCachedHandler } from "fastnode/cache";
+
+export default defineCachedHandler(
+  async () => {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return html`
+      Response generated at ${new Date().toISOString()} (took 500ms)
+      <br />(<a href="?skipCache=true">skip cache</a>)
+    `;
+  },
+  { shouldBypassCache: ({ req }) => req.url.includes("skipCache=true") }
+);
+```
+
+The handler simulates a slow operation with a 500ms delay. As `defineCachedHandler` wraps it, the response is cached after the first execution. The `shouldBypassCache` option checks for `?skipCache=true` in the URL and when present the cache is skipped and the handler runs fresh.
+
+<!-- /automd -->
+
+## Learn More
+
+- [Cache](/docs/cache)
+- [Storage](/docs/storage)

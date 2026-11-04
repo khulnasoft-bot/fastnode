@@ -1,0 +1,1539 @@
+import type { C12InputConfig, ConfigWatcher, DotenvOptions, ResolvedConfig } from "c12";
+import type { WatchConfigOptions } from "c12";
+import type { ChokidarOptions } from "chokidar";
+import type { CompatibilityDateSpec, CompatibilityDates } from "compatx";
+import type { LogLevel } from "./_consola.ts";
+import type { ConnectorName, ConnectorOptions } from "db0";
+import type { NestedHooks } from "hookable";
+import type { ProxyServerOptions } from "httpxy";
+import type {
+  CacheOptions as OCacheOptions,
+  CachedEventHandlerOptions as OCacheEventHandlerOptions,
+  MemoryStorageOptions as OCacheMemoryStorageOptions,
+} from "ocache";
+import type { PresetName, PresetNameInput, PresetOptions } from "../presets/index.ts";
+import type { DeployOptions } from "../deploy.ts";
+import type { TSConfig } from "pkg-types";
+import type { BuiltinDriverName, BuiltinDriverOptions } from "unstorage";
+import type { ExternalsTraceOptions } from "nf3";
+import type { UnwasmPluginOptions } from "unwasm/plugin";
+import type { RunnerName, RunnerReloadOptions } from "env-runner";
+import type {
+  EventHandlerFormat,
+  FastnodeDevEventHandler,
+  FastnodeErrorHandler,
+  FastnodeEventHandler,
+} from "./handler.ts";
+import type { FastnodeHooks } from "./hooks.ts";
+import type { FastnodeModuleInput } from "./module.ts";
+import type { Fastnode, FastnodeFrameworkInfo } from "./fastnode.ts";
+import type { FastnodeOpenAPIConfig } from "./openapi.ts";
+export type { FastnodeOpenAPIConfig } from "./openapi.ts";
+import type { FastnodePreset } from "./preset.ts";
+import type { FastnodeBuildPluginOption, OXCOptions, RolldownConfig } from "./build.ts";
+import type { CommonJSOptions } from "./_bundler.ts";
+import type { RollupConfig } from "./build.ts";
+import type { NormalizedRouteRules, RouteRuleConfig } from "./route-rules.ts";
+import type { JsonValue, OptionalDepType, SerializableOptions } from "./_utils.ts";
+
+/**
+ * Fully resolved Fastnode options available on `fastnode.options`.
+ *
+ * These are the normalized options after preset defaults and user config
+ * have been merged. For the user-facing input type, see {@link FastnodeConfig}.
+ *
+ * @see https://fastnode.khulnasoft.com/config
+ */
+/**
+ * Internal configuration properties populated during config resolution.
+ * Not part of the user-facing {@link FastnodeConfig}.
+ */
+export interface FastnodeInternalOptions {
+  /** The raw user config overrides passed to `loadOptions()`. */
+  _config: FastnodeConfig;
+  /** The resolved c12 config result (or watcher). */
+  _c12: ResolvedConfig<FastnodeConfig> | ConfigWatcher<FastnodeConfig>;
+  /** CLI-specific metadata (command name, …). */
+  _cli?: {
+    command?: string;
+  };
+
+  /**
+   * Resolved config layers, ordered from highest to lowest priority.
+   *
+   * The first layer is always the project root. It is followed by layers
+   * added with `extends` (local directories, config files, npm packages, or
+   * remote sources). Presets and inline config overrides are not included.
+   */
+  layers: FastnodeConfigLayer[];
+}
+
+/**
+ * General framework configuration: preset, compatibility date, logging level.
+ */
+export interface FastnodeGeneralOptions {
+  /**
+   * Opt-in date for deployment provider and runtime compatibility features.
+   *
+   * Providers introduce new features that Fastnode presets can leverage, but
+   * some need to be explicitly opted into. Set to the latest tested date
+   * in `YYYY-MM-DD` format.
+   *
+   * @default "latest"
+   * @see https://fastnode.khulnasoft.com/config/general#compatibilitydate
+   */
+  compatibilityDate: CompatibilityDates;
+
+  /**
+   * Enables debugging fastnode (build time) hooks in the console.
+   *
+   * @see https://fastnode.khulnasoft.com/config/general#debug
+   */
+  debug: boolean;
+
+  /**
+   * Deployment preset name.
+   *
+   * Determines how the production bundle is built and optimized for a
+   * specific hosting provider or runtime. Auto-detected in known
+   * environments when not set. Use the `FASTNODE_PRESET` environment
+   * variable as an alternative.
+   *
+   * @see https://fastnode.khulnasoft.com/config/general#preset
+   */
+  preset: PresetName;
+
+  /**
+   * Disable the server build and only output prerendered static assets.
+   *
+   * When `true`, the server bundle is skipped entirely and only the public directory is produced.
+   * Typically used by the `static` preset and its derivatives (e.g., `github-pages`, `vercel-static`).
+   *
+   * Note: This does not enable prerendering on its own — configure `prerender` options separately.
+   *
+   * @see https://fastnode.khulnasoft.com/config/general#static
+   */
+  static: boolean;
+
+  /**
+   * Log verbosity level.
+   *
+   * Defaults to `3`, or `1` when a testing environment is detected.
+   *
+   * @see https://fastnode.khulnasoft.com/config/general#loglevel
+   * @see https://github.com/unjs/consola
+   */
+  logLevel: LogLevel;
+
+  /**
+   * Server runtime configuration accessible via `useRuntimeConfig()`.
+   *
+   * Values can be overridden at runtime using environment variables with
+   * the `FASTNODE_` prefix. An alternative prefix can be configured via
+   * `runtimeConfig.fastnode.envPrefix` or `FASTNODE_ENV_PREFIX`.
+   *
+   * **Note:** The `fastnode` namespace is reserved for internal use.
+   *
+   * @example
+   * ```ts
+   * runtimeConfig: {
+   *   apiSecret: "default-secret", // override with FASTNODE_API_SECRET
+   * }
+   * ```
+   *
+   * @see https://fastnode.khulnasoft.com/config/general#runtimeconfig
+   */
+  runtimeConfig: FastnodeRuntimeConfig;
+}
+
+/**
+ * Directory and output path configuration.
+ */
+export interface FastnodeDirOptions {
+  /**
+   * Project workspace root directory.
+   *
+   * Auto-detected from the workspace (e.g. pnpm workspace) when not set.
+   *
+   * @see https://fastnode.khulnasoft.com/config/directories#workspacedir
+   */
+  workspaceDir: string;
+
+  /**
+   * Project main root directory.
+   *
+   * @see https://fastnode.khulnasoft.com/config/directories#rootdir
+   */
+  rootDir: string;
+
+  /**
+   * Server directory for scanning `api/`, `routes/`, `plugins/`, `utils/`,
+   * `middleware/`, `modules/`, and `tasks/` folders.
+   *
+   * Set to `false` to disable automatic directory scanning, `"./"` to use
+   * the root directory, or `"./server"` to use a `server/` subdirectory.
+   *
+   * @default false
+   * @see https://fastnode.khulnasoft.com/config/directories#serverdir
+   */
+  serverDir: string | false;
+
+  /**
+   * Additional directories to scan and auto-register files such as API
+   * route handlers.
+   *
+   * @see https://fastnode.khulnasoft.com/config/directories#scandirs
+   */
+  scanDirs: string[];
+
+  /**
+   * Directory name to scan for API route handlers.
+   *
+   * @default "api"
+   * @see https://fastnode.khulnasoft.com/config/directories#apidir
+   */
+  apiDir: string;
+
+  /**
+   * Directory name to scan for route handlers.
+   *
+   * @default "routes"
+   * @see https://fastnode.khulnasoft.com/config/directories#routesdir
+   */
+  routesDir: string;
+
+  /**
+   * Fastnode's temporary working directory for build-related files.
+   *
+   * @default "node_modules/.fastnode"
+   * @see https://fastnode.khulnasoft.com/config/directories#builddir
+   */
+  buildDir: string;
+
+  /**
+   * Output directories for the production bundle.
+   *
+   * @see https://fastnode.khulnasoft.com/config/directories#output
+   */
+  output: {
+    /** Production output root directory. */
+    dir: string;
+    /** Server bundle output directory. */
+    serverDir: string;
+    /** Public/static assets output directory. */
+    publicDir: string;
+  };
+
+  /**
+   * Directory (relative to the served base) for generated build assets.
+   *
+   * Applied as the bundler `assetsDir` for client and SSR environments, so
+   * generated assets are emitted and referenced under this path. Presets can
+   * use it to relocate content-addressed assets (e.g. Vercel immutable static
+   * files under `_vercel/immutable`).
+   */
+  buildAssetsDir?: string;
+
+  /** @deprecated Migrate to `serverDir`. */
+  srcDir: string;
+}
+
+/**
+ * Development-mode configuration: dev server, watcher, proxy.
+ */
+export interface FastnodeDevOptions {
+  /**
+   * Whether the current build targets development mode.
+   *
+   * Defaults to `true` during development and `false` for production.
+   *
+   * @see https://fastnode.khulnasoft.com/config/advanced#dev
+   */
+  dev: boolean;
+
+  /**
+   * Environment name used to apply `$env.<envName>` (or `$<envName>`) config overrides.
+   *
+   * Defaults to `"development"` in development and `"production"` otherwise. A custom
+   * name (for example `"staging"`) can be set with the `--envName` CLI flag or the
+   * `c12.envName` load option of `createFastnode()`. Available in server code as
+   * `import.meta.envName`.
+   *
+   * @see https://fastnode.khulnasoft.com/docs/configuration#environment-specific-config
+   */
+  envName: string;
+
+  /**
+   * Development server options.
+   *
+   * @see https://fastnode.khulnasoft.com/config/dev#devserver
+   */
+  devServer: {
+    /** Port number for the dev server. */
+    port?: number;
+    /** Hostname for the dev server. */
+    hostname?: string;
+    /** Additional paths to watch for dev server reloads. */
+    watch?: string[];
+    /** Runtime runner to use for the dev server. */
+    runner?: RunnerName;
+    /**
+     * Let the previous dev worker finish the requests and WebSockets it already accepted on
+     * reloads, and shut it down once they settle (or after `timeout` ms, default `60_000`).
+     *
+     * New requests go to the new worker right away.
+     *
+     * @default false
+     */
+    drain?: RunnerReloadOptions["drain"];
+    /**
+     * Serve `/.well-known/appspecific/com.chrome.devtools.json` so Chrome DevTools can connect
+     * the project folder as an automatic workspace.
+     *
+     * @default true
+     * @see https://chromium.googlesource.com/devtools/devtools-frontend/+/main/docs/ecosystem/automatic_workspace_folders.md
+     */
+    devtoolsJson?: boolean;
+  };
+
+  /**
+   * File watcher options for development mode.
+   *
+   * @see https://fastnode.khulnasoft.com/config/dev#watchoptions
+   * @see https://github.com/paulmillr/chokidar
+   */
+  watchOptions: ChokidarOptions;
+
+  /**
+   * Proxy configuration for the development server.
+   *
+   * A map of path prefixes to proxy target URLs or options.
+   *
+   * @example
+   * ```ts
+   * devProxy: {
+   *   "/proxy/test": "http://localhost:3001",
+   *   "/proxy/example": { target: "https://example.com", changeOrigin: true },
+   * }
+   * ```
+   *
+   * @see https://fastnode.khulnasoft.com/config/dev#devproxy
+   * @see https://github.com/unjs/httpxy
+   */
+  devProxy: Record<string, string | ProxyServerOptions>;
+}
+
+/**
+ * Build logging configuration.
+ */
+export interface FastnodeLoggingOptions {
+  /**
+   * Build logging behavior.
+   *
+   * @see https://fastnode.khulnasoft.com/config/general#logging
+   */
+  logging: {
+    /** Report compressed bundle sizes after build. */
+    compressedSizes?: boolean;
+    /** Show the build success message. */
+    buildSuccess?: boolean;
+  };
+}
+
+/**
+ * Advanced configuration: TypeScript, hooks, commands, framework metadata.
+ */
+export interface FastnodeAdvancedOptions {
+  /**
+   * TypeScript configuration options.
+   *
+   * @see https://fastnode.khulnasoft.com/config/advanced#typescript
+   */
+  typescript: {
+    /**
+     * TypeScript config used by the bundler (JSX options and path aliases).
+     *
+     * Defaults to the resolved `tsconfig.json` of the project root.
+     */
+    tsConfig?: Partial<TSConfig>;
+
+    /**
+     * Resolve path aliases (`compilerOptions.paths`) of `tsConfig` for the server sources.
+     *
+     * @default true
+     */
+    tsconfigPaths?: boolean;
+  };
+
+  /**
+   * Fastnode lifecycle hooks.
+   *
+   * @see https://fastnode.khulnasoft.com/config/advanced#hooks
+   * @see https://fastnode.khulnasoft.com/docs/lifecycle
+   * @see https://github.com/unjs/hookable
+   */
+  hooks: NestedHooks<FastnodeHooks>;
+
+  /**
+   * Preview and deploy command hints (usually filled by deployment presets).
+   *
+   * @see https://fastnode.khulnasoft.com/config/advanced#commands
+   */
+  commands: {
+    /** Command to preview the production build locally. */
+    preview?: string;
+    /**
+     * Command to deploy the production build.
+     *
+     * Can be a shell command (`./` paths are resolved relative to the output directory)
+     * or a function (used by presets that deploy programmatically).
+     */
+    deploy?: string | ((fastnode: Fastnode, opts: DeployOptions) => void | Promise<void>);
+  };
+
+  /**
+   * Metadata about the higher-level framework using Fastnode (e.g. Nuxt).
+   *
+   * Used by presets and included in build info output.
+   *
+   * @see https://fastnode.khulnasoft.com/config/advanced#framework
+   */
+  framework: FastnodeFrameworkInfo;
+}
+
+/**
+ * Feature flag and optional subsystem configuration: KV, cache, database,
+ * renderer, assets, plugins, modules, tasks, virtual modules, prerendering.
+ */
+export interface FastnodeFeatureOptions {
+  /**
+   * KV storage mount configuration.
+   *
+   * Keys are mount-point paths; values specify the unstorage driver and
+   * its options.
+   *
+   * @see https://fastnode.khulnasoft.com/config/storage#kv
+   * @see https://fastnode.khulnasoft.com/docs/storage
+   */
+  kv: KVMounts;
+
+  /** @deprecated Migrate to `kv`. */
+  storage: KVMounts;
+
+  /** @deprecated Migrate to `kv` inside `$development` (and `$prerender`) config. */
+  devStorage: KVMounts;
+
+  /**
+   * Cache storage and global default options for cached functions, cached handlers
+   * and `cache` route rules.
+   *
+   * @see https://fastnode.khulnasoft.com/config/storage#cache
+   * @see https://fastnode.khulnasoft.com/docs/cache
+   */
+  cache: FastnodeCacheConfig;
+
+  /**
+   * Database connection configurations.
+   *
+   * Requires `experimental.database: true`.
+   *
+   * @see https://fastnode.khulnasoft.com/config/storage#database
+   * @see https://fastnode.khulnasoft.com/docs/database
+   */
+  database: DatabaseConnectionConfigs;
+
+  /**
+   * Database connection overrides for development mode.
+   *
+   * @see https://fastnode.khulnasoft.com/config/storage#devdatabase
+   * @see https://fastnode.khulnasoft.com/docs/database
+   */
+  devDatabase: DatabaseConnectionConfigs;
+
+  /**
+   * Server-side rendering entry configuration.
+   *
+   * Points to the main render handler (the file should export an event
+   * handler as default). Set to `false` to disable.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#renderer
+   * @see https://fastnode.khulnasoft.com/docs/renderer
+   */
+  renderer?: { handler?: string; static?: boolean; template?: string };
+
+  /**
+   * Routes that should be server-side rendered.
+   */
+  ssrRoutes: string[];
+
+  /**
+   * Include a static asset handler in the server bundle to serve public assets.
+   *
+   * - `true` or `"node"` — read assets from the filesystem using Node.js `fs`.
+   * - `"inline"` — base64-encode assets directly into the server bundle.
+   * - `false` — do not serve static assets from the server (rely on a CDN or reverse proxy).
+   *
+   * Most self-hosted presets (e.g. `node-server`, `bun`) enable this by default.
+   *
+   * @see https://fastnode.khulnasoft.com/config/assets#servestatic
+   */
+  serveStatic: boolean | "node" | "inline";
+
+  /**
+   * Disable the public output directory entirely.
+   *
+   * Skips preparing the `.output/public` directory, copying public
+   * assets, and prerendering routes.
+   *
+   * @see https://fastnode.khulnasoft.com/config/assets#nopublicdir
+   */
+  noPublicDir: boolean;
+  tracingChannel?: undefined | TracingChannelOptions;
+
+  /**
+   * Build manifest options.
+   */ manifest?: {
+    /** Custom deployment identifier included in the build manifest. */
+    deploymentId?: string;
+  };
+
+  /**
+   * Built-in feature flags.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#features
+   */
+  features: {
+    /**
+     * Enable runtime hooks for request and response.
+     *
+     * By default this feature will be enabled if there is at least one fastnode plugin.
+     */
+    runtimeHooks?: boolean;
+
+    /**
+     * Enable WebSocket support.
+     */
+    websocket?: boolean;
+
+    /**
+     * Replace the global `Response` with srvx `FastResponse`, so that
+     * `new Response()` skips the native Response overhead in Node.js.
+     *
+     * Enabled by default when `node` is `true`.
+     */
+    fastResponse?: boolean;
+  };
+
+  /**
+   * Native wasm compatibility/bundling support configuration.
+   *
+   * Set to `false` to disable.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#wasm
+   * @see https://github.com/unjs/unwasm
+   */
+  wasm?: false | UnwasmPluginOptions;
+
+  /**
+   * OpenAPI specification generation and UI configuration.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#openapi
+   * @see https://fastnode.khulnasoft.com/docs/openapi
+   */
+  openAPI?: FastnodeOpenAPIConfig;
+
+  /**
+   * Experimental feature flags.
+   *
+   * These features are not yet stable and may change in future releases.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#experimental
+   */
+  experimental: {
+    /**
+     * Enable experimental OpenAPI support
+     *
+     * @see https://fastnode.khulnasoft.com/docs/openapi
+     */
+    openAPI?: boolean;
+    /**
+     * See https://github.com/microsoft/TypeScript/pull/51669
+     */
+    typescriptBundlerResolution?: boolean;
+    /**
+     * Enable native async context support for useRequest()
+     */
+    asyncContext?: boolean;
+    /**
+     * Set to `false` to disable sourcemap minification in production builds.
+     *
+     * Sourcemap minification is enabled by default when `sourcemap` is on.
+     */
+    sourcemapMinify?: false;
+    /**
+     * Set to `false` to disable entries-aware library chunks (Rolldown and Vite builders).
+     *
+     * By default, each `node_modules` package chunk is split by the entries (main entry and lazy
+     * route handlers) that use it, so startup does not load code that only lazy routes need.
+     * Disabling it produces fewer, larger library chunks.
+     */
+    entriesAwareLibChunks?: false;
+    /**
+     * Allow env expansion in runtime config
+     *
+     * @see https://github.com/khulnasoft/fastnode/pull/2043
+     */
+    envExpansion?: boolean;
+    /**
+     * Enable WebSocket upgrade support
+     *
+     * @deprecated Use `features.websocket` instead.
+     */
+    websocket?: boolean;
+    /**
+     * Enable experimental Database support
+     *
+     * @see https://fastnode.khulnasoft.com/docs/database
+     */
+    database?: boolean;
+    /**
+     * Enable experimental Tasks support
+     *
+     * @see https://fastnode.khulnasoft.com/docs/tasks
+     */
+    tasks?: boolean;
+
+    /**
+     * Log Fastnode tracing-channel spans to the console.
+     *
+     * Enables a built-in, dependency-free telemetry sink that `console.log`s
+     * each completed span (h3, srvx, unstorage, db0, …). Requires `tracingChannel`
+     * to be enabled.
+     */
+    tracingLogger?: boolean;
+  };
+
+  /**
+   * Server-side asset directories bundled at build time.
+   *
+   * @see https://fastnode.khulnasoft.com/config/assets#serverassets
+   * @see https://fastnode.khulnasoft.com/docs/assets#server-assets
+   */
+  serverAssets: ServerAssetDir[];
+
+  /**
+   * Public asset directories served in development and bundled in production.
+   *
+   * A `public/` directory is added by default when detected.
+   *
+   * @see https://fastnode.khulnasoft.com/config/assets#publicassets
+   * @see https://fastnode.khulnasoft.com/docs/assets
+   */
+  publicAssets: PublicAssetDir[];
+
+  /**
+   * Fastnode modules to extend behavior during initialization.
+   *
+   * Accepts module path strings, {@link FastnodeModule} objects, or bare setup functions.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#modules
+   */
+  modules?: FastnodeModuleInput[];
+
+  /**
+   * Paths to Fastnode runtime plugins.
+   *
+   * Plugins in the `plugins/` directory are auto-registered.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#plugins
+   * @see https://fastnode.khulnasoft.com/docs/plugins
+   */
+  plugins: string[];
+
+  /**
+   * Task definitions.
+   *
+   * Each key is a task name with a `handler` path and optional `description`.
+   *
+   * @example
+   * ```ts
+   * tasks: {
+   *   "db:migrate": {
+   *     handler: "./tasks/db-migrate",
+   *     description: "Run database migrations",
+   *   },
+   * }
+   * ```
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#tasks
+   * @see https://fastnode.khulnasoft.com/docs/tasks
+   */
+  tasks: { [name: string]: { handler?: string; description?: string } };
+
+  /**
+   * Map of cron expressions to task name(s).
+   *
+   * @example
+   * ```ts
+   * scheduledTasks: {
+   *   "0 * * * *": "cleanup:temp",
+   *   "*​/5 * * * *": ["health:check", "metrics:collect"],
+   * }
+   * ```
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#scheduledtasks
+   * @see https://fastnode.khulnasoft.com/docs/tasks
+   */
+  scheduledTasks: { [cron: string]: string | string[] };
+
+  /**
+   * Scheduler options for `scheduledTasks`.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#scheduler
+   */
+  scheduler: {
+    /**
+     * Run `scheduledTasks` in-process with the built-in cron runner, in presets that use it
+     * (`dev`, `node_*`, `bun` and `deno_server`).
+     *
+     * Set to `false` when something else invokes the scheduled tasks, such as a system cron.
+     * The tasks stay registered, so `runCronTasks()` and the `/_fastnode/tasks` dev route keep
+     * working. Platform schedules (Cloudflare Cron Triggers, Vercel Cron Jobs) are not affected.
+     *
+     * @default true
+     */
+    runner?: boolean;
+  };
+
+  /**
+   * Virtual module definitions.
+   *
+   * A map from dynamic virtual import names to their contents or an async
+   * function that returns them.
+   *
+   * @see https://fastnode.khulnasoft.com/config/features#virtual
+   */
+  virtual: Record<string, string | (() => string | Promise<string>)>;
+
+  /**
+   * Pre-compress public assets and prerendered routes.
+   *
+   * Generates gzip and brotli (and zstd when available)
+   * variants of compressible assets larger than 1024 bytes. Pass an
+   * object to selectively enable/disable each encoding.
+   *
+   * @see https://fastnode.khulnasoft.com/config/assets#compresspublicassets
+   */
+  compressPublicAssets: boolean | CompressOptions;
+
+  /**
+   * Glob patterns to ignore when scanning directories.
+   *
+   * @see https://fastnode.khulnasoft.com/config/directories#ignore
+   */
+  ignore: string[];
+
+  /**
+   * Additional dotted suffixes to keep as part of scanned file names (e.g. `"prompt"` for
+   * `routes/system.prompt.ts` → `/system.prompt`).
+   *
+   * Fastnode reserves trailing lowercase suffixes in scanned file names. Known file extensions
+   * (e.g. `.json`, `.md`, `.xml`) are always kept.
+   *
+   * @see https://fastnode.khulnasoft.com/config/directories#scansuffixes
+   */
+  scanSuffixes: string[];
+}
+
+/**
+ * Routing configuration: base URL, API routes, handlers, route rules, prerendering.
+ */
+export interface FastnodeRoutingOptions {
+  /**
+   * Server's main base URL prefix.
+   *
+   * Can also be set via the `FASTNODE_APP_BASE_URL` environment variable.
+   *
+   * @default "/"
+   * @see https://fastnode.khulnasoft.com/config/routing#baseurl
+   */
+  baseURL: string;
+
+  /**
+   * Base URL prefix for API routes.
+   *
+   * @default "/api"
+   * @see https://fastnode.khulnasoft.com/config/routing#apibaseurl
+   */
+  apiBaseURL: string;
+
+  /**
+   * Custom server entry point configuration.
+   *
+   * Set to `false` to disable the default server entry.
+   *
+   * @see https://fastnode.khulnasoft.com/docs/server-entry
+   */
+  serverEntry: false | { handler: string; format?: EventHandlerFormat };
+
+  /**
+   * Server handler registrations.
+   *
+   * Handlers in `routes/`, `api/`, and `middleware/` directories are
+   * auto-registered when {@link FastnodeOptions.serverDir | serverDir} is set.
+   *
+   * @see https://fastnode.khulnasoft.com/config/routing#handlers
+   * @see https://fastnode.khulnasoft.com/docs/routing
+   */
+  handlers: FastnodeEventHandler[];
+
+  /**
+   * Development-only event handlers with inline handler functions.
+   *
+   * Not included in production builds.
+   *
+   * @see https://fastnode.khulnasoft.com/config/routing#devhandlers
+   */
+  devHandlers: FastnodeDevEventHandler[];
+
+  /**
+   * Route rules applied to matching request paths.
+   *
+   * Supports caching, redirects, proxying, headers, CORS, and more.
+   * Rules are matched using rou3 patterns and deep-merged when multiple
+   * patterns match.
+   *
+   * @see https://fastnode.khulnasoft.com/config/routing#routerules
+   * @see https://fastnode.khulnasoft.com/docs/routing#route-rules
+   */
+  routeRules: { [path: string]: NormalizedRouteRules };
+
+  /**
+   * Inline route definitions.
+   *
+   * A map from route pattern to handler path or handler options.
+   *
+   * @see https://fastnode.khulnasoft.com/config/routing#routes
+   */
+  routes: Record<string, string | Omit<FastnodeEventHandler, "route" | "middleware">>;
+
+  /**
+   * Path(s) to custom runtime error handler(s).
+   *
+   * Custom handlers run before the built-in error handler, which is
+   * always added as a fallback.
+   *
+   * @see https://fastnode.khulnasoft.com/config/routing#errorhandler
+   */
+  errorHandler: string | string[];
+
+  /**
+   * Custom error handler function for development mode.
+   *
+   * @see https://fastnode.khulnasoft.com/config/advanced#deverrorhandler
+   */
+  devErrorHandler: FastnodeErrorHandler;
+
+  /**
+   * Prerendering options.
+   *
+   * Routes specified here are fetched during the build and copied to
+   * `.output/public` as static assets.
+   *
+   * @see https://fastnode.khulnasoft.com/config/routing#prerender
+   */
+  prerender: {
+    /**
+     * Prerender HTML routes within subfolders (`/test` produces `/test/index.html`).
+     */
+    autoSubfolderIndex?: boolean;
+    /** Maximum number of concurrent prerender requests. */
+    concurrency?: number;
+    /** Delay in milliseconds between prerender requests. */
+    interval?: number;
+    /** Crawl `<a>` tags in prerendered HTML to discover additional routes. */
+    crawlLinks?: boolean;
+    /** Fail the build when a route cannot be prerendered. */
+    failOnError?: boolean;
+    /**
+     * Patterns of routes to skip: a string prefix, a rou3 route pattern (a string
+     * containing `*` or `:`, e.g. `/blog/**`), a RegExp, or a function.
+     */
+    ignore?: Array<string | RegExp | ((path: string) => undefined | null | boolean)>;
+    /**
+     * Status codes of failed routes that do not fail the build when `failOnError` is enabled
+     * (e.g. `[404]`). These routes are still reported and not written.
+     */
+    ignoreStatusCodes?: number[];
+    /** Skip prerendering assets without a base URL prefix. */
+    ignoreUnprefixedPublicAssets?: boolean;
+    /** Explicit list of routes to prerender. */
+    routes?: string[];
+  };
+}
+
+/**
+ * Build configuration: bundler, Vite, Rollup/Rolldown, aliases, polyfills, tracing.
+ */
+export interface FastnodeBuildOptions {
+  /**
+   * Bundler to use for production builds.
+   *
+   * Auto-detected when not set: `"vite"` if a `vite.config` with the
+   * `fastnode()` plugin is found, otherwise `"rolldown"` (installed on demand). In development,
+   * `false` is used when `rolldown` is not installed.
+   * Use the `FASTNODE_BUILDER` environment variable as an alternative.
+   *
+   * Set to `false` to run the server sources without bundling (experimental, `dev` and
+   * `preview` only).
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#builder
+   */
+  builder?: "rollup" | "rolldown" | "vite" | false;
+
+  /**
+   * Options for the `vite` builder and the `fastnode/vite` plugin.
+   */
+  vite?: {
+    /**
+     * The `vite` package to use, as a path or `file://` URL to its directory or entry
+     * (e.g. `import.meta.resolve("vite")`).
+     *
+     * By default, the `fastnode/vite` plugin uses the running `vite` and the `vite` builder
+     * resolves it from the project root.
+     */
+    path?: string;
+
+    /**
+     * Additional Vite environments to register as fetchable services.
+     *
+     * Server environments with an entry (e.g. `ssr`) are registered automatically.
+     */
+    services?: Record<string, ViteServiceConfig>;
+
+    /**
+     * Enable `?assets` imports proposed by https://github.com/vitejs/vite/discussions/20913.
+     *
+     * @default true
+     */
+    assetsImport?: boolean;
+
+    /**
+     * Reload the dev server (and the browser) when a server-only module is updated.
+     *
+     * When disabled, server-only modules are still invalidated but the dev worker
+     * keeps its current evaluations.
+     *
+     * @default true
+     */
+    serverReload?: boolean;
+  };
+
+  /**
+   * Options for the optional dependencies Fastnode installs on demand (such as `vite`, `rolldown`,
+   * `unstorage` or `db0`).
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#deps
+   */
+  deps?: FastnodeDepsOptions;
+
+  /**
+   * Build plugins, applied with every builder (`rollup`, `rolldown`, `vite` and `false`).
+   *
+   * Plugins use the Rollup plugin interface. Only the `resolveId`, `load` and `transform` hooks
+   * are supported by all builders; with `builder: false`, plugins run in
+   * [env-runner](https://github.com/unjs/env-runner), which supports only these.
+   *
+   * Plugins with `enforce: "pre"` are placed before Fastnode's own plugins, the others after them
+   * (a hook's own `order` takes precedence).
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#buildplugins
+   */
+  buildPlugins: FastnodeBuildPluginOption[];
+
+  /**
+   * Additional Rollup configuration.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#rollupconfig
+   */
+  rollupConfig?: RollupConfig;
+
+  /**
+   * Additional Rolldown configuration.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#rolldownconfig
+   */
+  rolldownConfig?: RolldownConfig;
+
+  /**
+   * Bundler entry point path.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#entry
+   */
+  entry: string;
+
+  /** @deprecated Migrate to `alias`, `inject`, `polyfills` and `builtinModules`. */
+  unenv: LegacyUnenvPreset[];
+
+  /**
+   * Path aliases for module resolution.
+   *
+   * @example
+   * ```ts
+   * alias: {
+   *   "~utils": "./src/utils",
+   *   "#shared": "./shared",
+   * }
+   * ```
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#alias
+   */
+  alias: Record<string, string>;
+
+  /**
+   * Globals to replace with imports when referenced in the bundle.
+   *
+   * Values are a module id (default export) or a `[id, exportName]` tuple.
+   * Set a global to `false` to remove a default injection (e.g. one added
+   * for `node: false` builds).
+   *
+   * @example
+   * ```ts
+   * inject: {
+   *   Buffer: ["node:buffer", "Buffer"],
+   * }
+   * ```
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#inject
+   */
+  inject: Record<string, string | [id: string, exportName: string] | false>;
+
+  /**
+   * Modules imported for their side effects before the server entry.
+   *
+   * Prefix an entry with `!` to remove a default polyfill.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#polyfills
+   */
+  polyfills: string[];
+
+  /**
+   * Modules provided by the target runtime (e.g. `node:fs` on Deno or
+   * `cloudflare:workers`).
+   *
+   * Imports of these ids are kept as-is in the output: they are never bundled,
+   * traced or copied, so only list modules the runtime itself provides. To
+   * keep an npm package out of the bundle, use `traceDeps` instead.
+   *
+   * Prefix an entry with `!` to remove a default (e.g. one added by a preset).
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#builtinmodules
+   */
+  builtinModules: string[];
+
+  /**
+   * Minify the production bundle.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#minify
+   */
+  minify: boolean;
+
+  /**
+   * Bundle all code into a single file instead of separate chunks.
+   *
+   * When `false`, each route handler becomes a separate chunk loaded
+   * on-demand. Some presets enable this by default.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#inlinedynamicimports
+   */
+  inlineDynamicImports: boolean;
+
+  /**
+   * Enable source map generation.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#sourcemap
+   */
+  sourcemap: boolean;
+
+  /**
+   * Target a Node.js-compatible runtime.
+   *
+   * When `true` (default), the bundler targets the `node` platform, prefers
+   * Node.js built-in modules, and enables dependency externalization.
+   *
+   * When `false`, Fastnode adds default `alias`, `inject` and `polyfills`
+   * entries that polyfill Node.js globals and built-ins for non-Node
+   * runtimes (workers, edge, Deno).
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#node
+   */
+  node: boolean;
+
+  /**
+   * OXC options for Rolldown builds (minification and transforms).
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#oxc
+   */
+  oxc?: OXCOptions;
+
+  /**
+   * Build-time string replacements.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#replace
+   */
+  replace: Record<string, string | ((id: string) => string)>;
+
+  /**
+   * Additional configuration for the Rollup CommonJS plugin.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#commonjs
+   */
+  commonJS?: CommonJSOptions;
+
+  /**
+   * Custom export conditions for module resolution.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#exportconditions
+   */
+  exportConditions?: string[];
+
+  /**
+   * Prevent packages from being externalized.
+   *
+   * Set to `true` to bundle all dependencies, or pass an array of patterns
+   * matched against both the import specifier and the resolved module path.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#noexternals
+   */
+  noExternals?: boolean | (string | RegExp)[];
+
+  /**
+   * Additional dependencies to trace and include in the build output.
+   *
+   * Supports `!pkg` to exclude and `pkg*` for full package trace.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#tracedeps
+   */
+  traceDeps?: (string | RegExp)[];
+
+  /**
+   * Advanced options for dependency tracing via nf3.
+   *
+   * @see https://fastnode.khulnasoft.com/config/build#traceopts
+   * @see https://github.com/unjs/nf3
+   */
+  traceOpts?: Pick<ExternalsTraceOptions, "nft" | "traceAlias" | "chmod" | "transform" | "hooks">;
+}
+
+export interface FastnodeOptions
+  extends
+    PresetOptions,
+    FastnodeInternalOptions,
+    FastnodeGeneralOptions,
+    FastnodeDirOptions,
+    FastnodeFeatureOptions,
+    FastnodeDevOptions,
+    FastnodeLoggingOptions,
+    FastnodeRoutingOptions,
+    FastnodeBuildOptions,
+    FastnodeAdvancedOptions {}
+
+/**
+ * User-facing Fastnode configuration used in `fastnode.config.ts` or
+ * `defineConfig()`.
+ *
+ * All properties are optional and will be merged with defaults and preset
+ * values to produce the fully resolved {@link FastnodeOptions}.
+ *
+ * @see https://fastnode.khulnasoft.com/config
+ * @see https://fastnode.khulnasoft.com/docs/configuration
+ */
+export interface FastnodeConfig
+  extends
+    Partial<
+      Omit<
+        FastnodeOptions,
+        | "routeRules"
+        | "rollupConfig"
+        | "preset"
+        | "compatibilityDate"
+        | "unenv"
+        | "serverDir"
+        | "_config"
+        | "_c12"
+        | "layers"
+        | "envName"
+        | "serverEntry"
+        | "renderer"
+        | "output"
+        | "tracingChannel"
+      >
+    >,
+    C12InputConfig<FastnodeConfig> {
+  /** Config overrides applied when prerendering (on top of the build env overrides, `$production` by default). */
+  $prerender?: FastnodeConfig;
+
+  preset?: PresetNameInput;
+
+  /**
+   * Customize the preset used as the **fallback** when no `preset` is set and
+   * none of the known hosting providers are auto-detected.
+   *
+   * By default, Fastnode falls back to the runtime-based preset (`node`, and
+   * `deno` or `bun` when running on those runtimes). An explicit `preset`,
+   * the `FASTNODE_PRESET` environment variable, and auto-detected providers
+   * (Vercel, Netlify, Cloudflare Pages, …) all take precedence over this.
+   *
+   * Accepts a preset name or an inline preset definition.
+   *
+   * @see https://fastnode.khulnasoft.com/config/general#defaultpreset
+   */
+  defaultPreset?: PresetNameInput | FastnodePreset;
+
+  extends?: string | string[] | FastnodePreset;
+  routeRules?: { [path: string]: RouteRuleConfig };
+  rollupConfig?: Partial<RollupConfig>;
+  compatibilityDate?: CompatibilityDateSpec;
+  /** @deprecated Migrate to `alias`, `inject`, `polyfills` and `builtinModules`. */
+  unenv?: LegacyUnenvPreset | LegacyUnenvPreset[];
+  serverDir?: boolean | "./" | "./server" | (string & {});
+  serverEntry?: string | FastnodeOptions["serverEntry"];
+  renderer?: false | FastnodeOptions["renderer"];
+  output?: Partial<FastnodeOptions["output"]>;
+  tracingChannel?: boolean | TracingChannelOptions;
+}
+
+// ------------------------------------------------------------
+// Config Loader
+// ------------------------------------------------------------
+
+/** Options for loading Fastnode configuration via c12. */
+export interface LoadConfigOptions {
+  watch?: boolean;
+  c12?: WatchConfigOptions;
+  compatibilityDate?: CompatibilityDateSpec;
+  dotenv?: boolean | DotenvOptions;
+}
+
+// ------------------------------------------------------------
+// Partial types
+// ------------------------------------------------------------
+
+/**
+ * A resolved config layer available on `fastnode.options.layers`.
+ */
+export interface FastnodeConfigLayer {
+  /** Absolute path to the layer directory. */
+  cwd: string;
+
+  /** Absolute path to the layer config file, if one exists. */
+  configFile?: string;
+
+  /**
+   * Config defined by this layer (before merging with other layers and
+   * defaults). Environment-specific overrides such as `$production` are
+   * already applied.
+   */
+  config: FastnodeConfig;
+
+  /** Layer metadata from `$meta` in the layer config or `extends` options. */
+  meta?: { name?: string; [key: string]: unknown };
+}
+
+/**
+ * Options for the optional dependencies Fastnode installs on demand.
+ *
+ * @see https://fastnode.khulnasoft.com/config/build#deps
+ */
+export interface FastnodeDepsOptions {
+  /**
+   * Explicit packages to use, by package name, as a path or `file://` URL to the package
+   * directory or entry (e.g. `import.meta.resolve("unstorage")`). Relative paths resolve
+   * against `rootDir`.
+   *
+   * By default, these packages are resolved from the project root and installed on demand. A
+   * framework built on top of Fastnode can pass its own copies, so the versions it depends on are
+   * the ones that run. `deps.paths.vite` and `vite.path` are aliases.
+   */
+  paths?: Record<string, string>;
+
+  /**
+   * Whether a missing package may be installed. Disable it to fail with the install command
+   * instead, so a build only uses the committed dependencies.
+   *
+   * Interactive environments prompt before installing (except for the packages the server
+   * bundle imports). Nothing is installed in tests, for an explicit package in `paths`, or
+   * when `rootDir` is inside `node_modules`.
+   *
+   * @default true, or `false` in CI
+   */
+  install?: boolean;
+}
+
+/**
+ * Vite environment registered as a fetchable service.
+ *
+ * @see https://fastnode.khulnasoft.com/config/build#vite
+ */
+export interface ViteServiceConfig {
+  /** Path to the service entry. */
+  entry: string;
+}
+
+/**
+ * Configuration for a public asset directory served in development and
+ * bundled in production.
+ *
+ * @see https://fastnode.khulnasoft.com/config/assets#publicassets
+ * @see https://fastnode.khulnasoft.com/docs/assets
+ */
+export interface PublicAssetDir {
+  /** URL prefix under which these assets are served. */
+  baseURL?: string;
+  /** Fall through to the next handler when the asset is not found. */
+  fallthrough?: boolean;
+  /**
+   * `Cache-Control` max-age value in seconds.
+   *
+   * Left `undefined` when unset, which some presets (such as Vercel) treat
+   * differently from an explicit `0`.
+   */
+  maxAge?: number;
+  /** Filesystem path to the asset directory. */
+  dir: string;
+  /**
+   * Pass `false` to disable ignore patterns when scanning the directory,
+   * or pass an array of glob patterns to ignore (overrides global
+   * `fastnode.ignore` patterns).
+   */
+  ignore?: false | string[];
+}
+
+/**
+ * Pre-compression options for public assets and prerendered routes.
+ *
+ * @see https://fastnode.khulnasoft.com/config/assets#compresspublicassets
+ */
+export interface CompressOptions {
+  /** Enable gzip pre-compression. */
+  gzip?: boolean;
+  /** Enable brotli pre-compression. */
+  brotli?: boolean;
+  /** Enable zstd pre-compression. */
+  zstd?: boolean;
+}
+
+/**
+ * Configuration for a server-side asset directory bundled at build time.
+ *
+ * @see https://fastnode.khulnasoft.com/config/assets#serverassets
+ * @see https://fastnode.khulnasoft.com/docs/assets#server-assets
+ */
+export interface ServerAssetDir {
+  /** Logical name used to access the asset group at runtime. */
+  baseName: string;
+  /** Glob pattern to filter files within the directory. */
+  pattern?: string;
+  /** Filesystem path to the asset directory. */
+  dir: string;
+  /** Glob patterns to ignore when scanning the directory. */
+  ignore?: string[];
+}
+
+/**
+ * Tracing channel options.
+ *
+ * @see https://fastnode.khulnasoft.com/config/advanced#tracingchannel
+ */
+export interface TracingChannelOptions {
+  srvx?: boolean;
+  h3?: boolean;
+  unstorage?: boolean;
+  /** Database queries made with `useDatabase()` (`db0.query`). Requires `experimental.database`. */
+  db0?: boolean;
+}
+
+/**
+ * Preset shape accepted by the deprecated `unenv` option (compatible with
+ * unenv's `Preset`).
+ *
+ * @deprecated Migrate to `alias`, `inject`, `polyfills` and `builtinModules`.
+ */
+export interface LegacyUnenvPreset {
+  meta?: {
+    readonly name?: string;
+    readonly version?: string;
+    /** Path or URL used to resolve the preset's module ids. */
+    readonly url?: string | URL;
+  };
+  alias?: Readonly<Record<string, string>>;
+  inject?: Readonly<Record<string, string | readonly string[] | false>>;
+  polyfill?: readonly string[];
+  external?: readonly string[];
+}
+
+/** Driver name (module id or alias) of a driver that is not builtin. */
+type CustomDriverName = string & { _custom?: any };
+
+/**
+ * Mount configuration for a builtin `unstorage` driver.
+ *
+ * Driver options are inferred from the `driver` name.
+ */
+export type BuiltinKVMount = {
+  [Name in KVDriverName]: { driver: Name } & (Name extends keyof BuiltinDriverOptions
+    ? SerializableOptions<BuiltinDriverOptions[Name]>
+    : unknown);
+}[KVDriverName];
+
+/** Builtin driver names (none when `unstorage` is not installed). */
+type KVDriverName = OptionalDepType<BuiltinDriverName, never>;
+
+/** Mount configuration for a custom driver (module id or alias). */
+export type CustomKVMount = {
+  driver: CustomDriverName;
+  [option: string]: JsonValue;
+};
+
+export type KVMount = BuiltinKVMount | CustomKVMount;
+
+/**
+ * KV mount configuration mapping mount points to driver options.
+ *
+ * Keys are mount-point paths; values specify the unstorage driver
+ * and its options.
+ *
+ * @see https://fastnode.khulnasoft.com/config/storage#kv
+ * @see https://fastnode.khulnasoft.com/docs/storage
+ */
+export interface KVMounts {
+  [path: string]: KVMount;
+}
+
+/** @deprecated Use {@link KVMount}. */
+export type StorageMount = KVMount;
+
+/** @deprecated Use {@link KVMounts}. */
+export type StorageMounts = KVMounts;
+
+// Cache
+
+/** Cache storage driver. */
+export type FastnodeCacheDriver = "memory" | "fs" | "kv";
+
+/** Options shared by cached functions and cached handlers. */
+export type FastnodeCacheFunctionDefaults = Pick<
+  OCacheOptions,
+  "maxAge" | "swr" | "staleMaxAge" | "maxResolveTime" | "base"
+>;
+
+/** Options that only apply to cached handlers and `cache` route rules. */
+export type FastnodeCacheHandlerDefaults = Pick<
+  OCacheEventHandlerOptions,
+  | "varies"
+  | "allowQuery"
+  | "allowCookies"
+  | "allowAuthorization"
+  | "sendCacheControl"
+  | "cacheStatusHeader"
+  | "maxBodySize"
+>;
+
+/** Global default options for cached functions, cached handlers and `cache` route rules. */
+export interface FastnodeCacheDefaults
+  extends FastnodeCacheFunctionDefaults, FastnodeCacheHandlerDefaults {}
+
+/**
+ * Cache configuration.
+ *
+ * @see https://fastnode.khulnasoft.com/config/storage#cache
+ */
+export interface FastnodeCacheConfig {
+  /**
+   * Cache storage driver.
+   *
+   * - `"memory"`: in-process LRU memory storage (not persisted across restarts).
+   * - `"fs"`: filesystem storage (Node.js compatible runtimes only).
+   * - `"kv"`: the Fastnode [KV storage layer](https://fastnode.khulnasoft.com/docs/storage) (`useKV()`).
+   *
+   * Defaults to `"kv"` when a `cache` (or `cache:*` / `cache/*`) KV mount point is
+   * configured, and to `"memory"` otherwise.
+   */
+  driver?: FastnodeCacheDriver;
+
+  /** Options for the `memory` driver. */
+  memory?: Omit<OCacheMemoryStorageOptions, "sizeOf">;
+
+  /** Options for the `fs` driver. */
+  fs?: {
+    /**
+     * Directory to store cache entries in.
+     *
+     * Relative paths resolve against `rootDir` in development and prerendering, and against
+     * the working directory of the server process in production.
+     *
+     * Defaults to `.data/cache`.
+     */
+    dir?: string;
+  };
+
+  /**
+   * Global default options for every cached function, cached handler and `cache` route rule.
+   *
+   * Shared options (`maxAge`, `swr`, `staleMaxAge`, `maxResolveTime`, `base`) apply to all of
+   * them, handler-only options only apply to cached handlers and route rules.
+   * Per-cache options take precedence.
+   */
+  defaults?: FastnodeCacheDefaults;
+}
+
+// Database
+
+/** Logical database connection name. Defaults to `"default"`. */
+export type DatabaseConnectionName = "default" | (string & {});
+
+/**
+ * Database connection configuration specifying a db0 connector and options.
+ *
+ * @see https://fastnode.khulnasoft.com/config/storage#database
+ * @see https://fastnode.khulnasoft.com/docs/database
+ */
+export type DatabaseConnectionConfig = [DatabaseConnectorName] extends [never]
+  ? { connector: string; options?: Record<string, JsonValue> }
+  : {
+      [Name in DatabaseConnectorName]: {
+        connector: Name;
+        options?: Name extends keyof ConnectorOptions
+          ? SerializableOptions<ConnectorOptions[Name]>
+          : Record<string, JsonValue>;
+      };
+    }[DatabaseConnectorName];
+
+/** Connector names (none when `db0` is not installed). */
+type DatabaseConnectorName = OptionalDepType<ConnectorName, never>;
+
+/** Map of {@link DatabaseConnectionName} to {@link DatabaseConnectionConfig}. */
+export type DatabaseConnectionConfigs = Record<DatabaseConnectionName, DatabaseConnectionConfig>;
+
+// Runtime config
+
+/**
+ * Server runtime configuration accessible via `useRuntimeConfig()`.
+ *
+ * Values can be overridden at runtime using environment variables with
+ * the `FASTNODE_` prefix. An alternative prefix can be configured via
+ * `fastnode.envPrefix` or `FASTNODE_ENV_PREFIX`.
+ *
+ * @see https://fastnode.khulnasoft.com/config/general#runtimeconfig
+ */
+export interface FastnodeRuntimeConfig {
+  fastnode?: {
+    envPrefix?: string;
+    envExpansion?: boolean;
+    routeRules?: {
+      [path: string]: RouteRuleConfig;
+    };
+    openAPI?: FastnodeOpenAPIConfig;
+  };
+  [key: string]: any;
+}

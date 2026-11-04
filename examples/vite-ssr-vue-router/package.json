@@ -1,0 +1,17 @@
+{
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite dev",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "fastnode": "latest",
+    "unhead": "^3.4.3",
+    "vite": "latest",
+    "vite-plugin-devtools-json": "^1.1.2",
+    "vue": "^3.5.44",
+    "vue-router": "^5.4.0"
+  }
+}

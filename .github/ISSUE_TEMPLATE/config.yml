@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📚 Fastnode Documentation
+    url: https://fastnode.khulnasoft.com/
+    about: Check the documentation for usage of Nuxt 3
+  - name: 💬 Discussions
+    url: https://github.com/khulnasoft/fastnode/discussions
+    about: Use discussions if you have an idea for improvement and asking questions
+  - name: 🔗 Nuxt related Issues
+    url: https://github.com/nuxt/nuxt/issues/new/choose
+    about: Please open an issue in nuxt/nuxt to discuss

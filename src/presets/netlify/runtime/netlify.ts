@@ -1,0 +1,32 @@
+import "#fastnode/virtual/polyfills";
+import { useFastnodeApp } from "fastnode/app";
+import type { ServerRequest } from "srvx";
+
+const fastnodeApp = useFastnodeApp();
+
+const ONE_YEAR_IN_SECONDS = 365 * 24 * 60 * 60;
+
+const handler = async (req: ServerRequest): Promise<Response> => {
+  req.runtime ??= { name: "netlify" };
+  req.ip ??= req.headers.get("x-nf-client-connection-ip") || undefined;
+
+  const response = await fastnodeApp.fetch(req);
+
+  const isr = req.context?.routeRules?.isr;
+  if (isr) {
+    const maxAge = typeof isr === "number" ? isr : ONE_YEAR_IN_SECONDS;
+    const revalidateDirective =
+      typeof isr === "number" ? `stale-while-revalidate=${ONE_YEAR_IN_SECONDS}` : "must-revalidate";
+    if (!response.headers.has("Cache-Control")) {
+      response.headers.set("Cache-Control", "public, max-age=0, must-revalidate");
+    }
+    response.headers.set(
+      "Netlify-CDN-Cache-Control",
+      `public, max-age=${maxAge}, ${revalidateDirective}, durable`
+    );
+  }
+
+  return response;
+};
+
+export default handler;

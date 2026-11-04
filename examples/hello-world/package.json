@@ -1,0 +1,12 @@
+{
+  "type": "module",
+  "scripts": {
+    "build": "fastnode build",
+    "dev": "fastnode dev",
+    "preview": "node .output/server/index.mjs"
+  },
+  "devDependencies": {
+    "fastnode": "latest",
+    "rolldown": "latest"
+  }
+}

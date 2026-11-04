@@ -1,0 +1,310 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "pathe";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { Fastnode, FastnodeOptions } from "fastnode/types";
+
+import { generateStaticFiles } from "../../src/presets/vercel/utils.ts";
+
+type Route = {
+  src?: string;
+  dest?: string;
+  headers?: Record<string, string>;
+  status?: number;
+  methods?: string[];
+  continue?: boolean;
+  handle?: string;
+};
+
+const dirs: string[] = [];
+
+afterAll(async () => {
+  await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+async function buildRoutes(options: Partial<FastnodeOptions>): Promise<Route[]> {
+  const dir = await mkdtemp(join(tmpdir(), "fastnode-vercel-build-config-"));
+  dirs.push(dir);
+  const fastnode = {
+    _prerenderedRoutes: [],
+    options: {
+      baseURL: "/",
+      static: false,
+      framework: { name: "fastnode", version: "3.x" },
+      experimental: {},
+      publicAssets: [],
+      output: { dir, serverDir: join(dir, "functions/__server.func") },
+      routeRules: {},
+      vercel: {},
+      ...options,
+    },
+  } as unknown as Fastnode;
+  await generateStaticFiles(fastnode);
+  return JSON.parse(await readFile(join(dir, "config.json"), "utf8")).routes;
+}
+
+// Vercel stops at the first matching route that does not `continue`
+const firstMatch = (routes: Route[], path: string) =>
+  routes.find((r) => r.src && !r.continue && new RegExp(r.src).test(path));
+
+describe("vercel config with a baseURL", () => {
+  let routes: Route[];
+
+  beforeAll(async () => {
+    routes = await buildRoutes({
+      baseURL: "/base/",
+      routeRules: {
+        "/hdr/**": { headers: { "x-hdr": "1" } },
+        "/old/**": { redirect: { to: "/new/**", status: 307 } },
+        "/cdn/**": { proxy: { to: "https://example.com/**" } },
+        "/isr/**": { isr: true },
+      },
+      vercel: {
+        functionRules: {
+          "/fn/**": { maxDuration: 10 },
+          "/fn/special": { maxDuration: 20 },
+        },
+      },
+    } as Partial<FastnodeOptions>);
+  });
+
+  // Route rule keys are relative to the baseURL, as at runtime
+  it("prefixes header rules", () => {
+    const route = routes.find((r) => r.src && new RegExp(r.src).test("/base/hdr/a"));
+    expect(route?.headers).toEqual({ "x-hdr": "1" });
+  });
+
+  it("prefixes redirect rules but not their target", () => {
+    expect(firstMatch(routes, "/base/old/a/b")).toMatchObject({
+      status: 307,
+      headers: { Location: "/new/$1" },
+    });
+  });
+
+  it("prefixes proxy rules", () => {
+    expect(firstMatch(routes, "/base/cdn/a")?.dest).toBe("https://example.com/$1");
+  });
+
+  it("prefixes ISR rules", () => {
+    expect(firstMatch(routes, "/base/isr/a")?.dest).toBe("/isr/[...]-isr?__isr_route=$__isr_route");
+  });
+
+  it("orders functionRules routes from the most specific", () => {
+    expect(firstMatch(routes, "/base/fn/special")?.dest).toBe("/fn/special");
+    expect(firstMatch(routes, "/base/fn/other")?.dest).toBe("/fn/[...]");
+  });
+});
+
+// Vercel re-encodes a capture substituted into a query string (`a&b=c` adds a
+// param, `a+b` becomes `a b`), unlike h3, so these rules stay in the function.
+describe("vercel config with `**` in the query of a target", () => {
+  let routes: Route[];
+
+  beforeAll(async () => {
+    routes = await buildRoutes({
+      routeRules: {
+        "/r/**": { redirect: { to: "/landing", status: 307 } },
+        "/r/query/**": { redirect: { to: "/q?path=**", status: 301 } },
+        "/r/hash/**": { redirect: { to: "/h#**", status: 301 } },
+        "/r/path/**": { redirect: { to: "/p/**?keep=1", status: 301 } },
+        "/r/proxy/**": { proxy: { to: "https://example.com/search?q=**" } },
+      },
+    } as Partial<FastnodeOptions>);
+  });
+
+  it("leaves query redirects to the server function", () => {
+    const route = firstMatch(routes, "/r/query/a&b=c");
+    expect(route?.src).toBeDefined();
+    expect(route?.status).toBeUndefined();
+    expect(route?.headers).toBeUndefined();
+  });
+
+  it("leaves fragment redirects to the server function", () => {
+    expect(firstMatch(routes, "/r/hash/a")?.status).toBeUndefined();
+  });
+
+  it("leaves query proxies to the server function", () => {
+    const route = firstMatch(routes, "/r/proxy/a");
+    expect(route?.src).toBeDefined();
+    expect(route?.dest).toBeUndefined();
+    expect(route?.status).toBeUndefined();
+    expect(routes.some((r) => r.dest?.startsWith("https://example.com"))).toBe(false);
+  });
+
+  it("keeps redirects with `**` in the path at the CDN", () => {
+    expect(firstMatch(routes, "/r/path/a")).toMatchObject({
+      status: 301,
+      headers: { Location: "/p/$1?keep=1" },
+    });
+  });
+
+  it("keeps less specific redirects at the CDN", () => {
+    expect(firstMatch(routes, "/r/other")).toMatchObject({
+      status: 307,
+      headers: { Location: "/landing" },
+    });
+  });
+});
+
+describe("vercel config with `redirect: false`", () => {
+  let routes: Route[];
+
+  beforeAll(async () => {
+    routes = await buildRoutes({
+      routeRules: {
+        "/foo/**": { redirect: { to: "/x", status: 307 } },
+        "/foo/keep": { redirect: false },
+        "/foo/keep-all/**": { redirect: false },
+        "/foo/keep-hdr": { redirect: false, headers: { "x-keep": "1" } },
+        "/account": { redirect: false },
+        "/scoped/**": { redirect: false, headers: { "x-scoped": "1" } },
+        "/scoped/old": { redirect: { to: "/new", status: 307 } },
+        "/scoped/cdn/**": { proxy: { to: "https://example.com/**" } },
+        "/café/**": { redirect: { to: "/x", status: 307 } },
+        "/café/keep": { redirect: false },
+      },
+      publicAssets: [{ dir: "/public/scoped/assets", baseURL: "/scoped/assets", maxAge: 3600 }],
+    } as Partial<FastnodeOptions>);
+  });
+
+  it("keeps the opted out path from the broader redirect", () => {
+    // `/foo/keep` has to be handled by the server, not the `/foo/**` redirect (#4655)
+    const keep = firstMatch(routes, "/foo/keep");
+    expect(keep).toBeDefined();
+    expect(keep!.headers?.Location).toBeUndefined();
+  });
+
+  it("keeps opted out paths with headers from the broader redirect", () => {
+    expect(firstMatch(routes, "/foo/keep-hdr")?.headers?.Location).toBeUndefined();
+  });
+
+  // `routeToRegExp` percent-encodes literals, so patterns are compared as routes
+  it("keeps opted out paths with encoded characters from the broader redirect", () => {
+    expect(firstMatch(routes, "/caf%C3%A9/keep")?.headers?.Location).toBeUndefined();
+    expect(firstMatch(routes, "/caf%C3%A9/other")?.headers?.Location).toBe("/x");
+  });
+
+  // A `redirect: false` path must not stop routing before more specific rules (#4655)
+  it("keeps more specific rules under an opted out path at the CDN", () => {
+    expect(firstMatch(routes, "/scoped/old")).toMatchObject({
+      status: 307,
+      headers: { Location: "/new" },
+    });
+    expect(firstMatch(routes, "/scoped/cdn/a")?.dest).toBe("https://example.com/$1");
+    const assetStop = routes.findIndex(
+      (r) =>
+        r.handle === "filesystem" ||
+        (r.src && !r.continue && new RegExp(r.src).test("/scoped/assets/app.js"))
+    );
+    expect(routes[assetStop]).toEqual({ handle: "filesystem" });
+    expect(routes.slice(0, assetStop)).toContainEqual(
+      expect.objectContaining({ headers: { "cache-control": "public, max-age=3600, immutable" } })
+    );
+  });
+
+  it("keeps opted out wildcard paths from the broader redirect", () => {
+    const keep = firstMatch(routes, "/foo/keep-all/a/b");
+    expect(keep).toBeDefined();
+    expect(keep!.headers?.Location).toBeUndefined();
+  });
+
+  it("still redirects the rest of the broader rule", () => {
+    expect(firstMatch(routes, "/foo/other")!.headers?.Location).toBe("/x");
+  });
+
+  // A stop route would also skip skew protection and public asset headers
+  it("emits no route when no redirect can match", () => {
+    expect(firstMatch(routes, "/account")).toEqual({ src: "/(.*)", dest: "/__server" });
+  });
+});
+
+describe("vercel config with method-scoped rules", () => {
+  let routes: Route[];
+
+  beforeAll(async () => {
+    routes = await buildRoutes({
+      routeRules: {
+        "GET /old/**": { redirect: { to: "/new/**", status: 302 } },
+        "/old/**": { redirect: { to: "/all", status: 307 } },
+        "POST /form": { redirect: { to: "/thanks", status: 303 } },
+        "GET /hdr/**": { headers: { "x-get": "1" } },
+        "/hdr/**": { headers: { "x-hdr": "1" } },
+        "PUT /cdn/**": { proxy: { to: "https://example.com/**" } },
+        "/m/**": { redirect: { to: "/x", status: 307 } },
+        "GET /m/keep": { redirect: false },
+        "GET /g/**": { redirect: { to: "/x", status: 307 } },
+        "/g/keep": { redirect: false },
+        "POST /p/**": { redirect: { to: "/x", status: 307 } },
+        "GET /p/keep": { redirect: false },
+        "HEAD /hg": { redirect: { to: "/h", status: 307 } },
+        "GET /hg": { redirect: { to: "/g", status: 307 } },
+      },
+    } as Partial<FastnodeOptions>);
+  });
+
+  const matches = (path: string, method: string) =>
+    routes.filter(
+      (r) =>
+        r.src &&
+        !r.continue &&
+        (!r.methods || r.methods.includes(method)) &&
+        new RegExp(r.src).test(path)
+    );
+
+  it("scopes redirects to their methods", () => {
+    expect(matches("/old/a", "GET")[0]).toMatchObject({
+      methods: ["GET", "HEAD"],
+      status: 302,
+      headers: { Location: "/new/$1" },
+    });
+    expect(matches("/old/a", "HEAD")[0]?.headers?.Location).toBe("/new/$1");
+    expect(matches("/old/a", "POST")[0]).toMatchObject({
+      status: 307,
+      headers: { Location: "/all" },
+    });
+    expect(matches("/form", "POST")[0]).toMatchObject({ methods: ["POST"], status: 303 });
+    expect(matches("/form", "GET")[0]?.status).toBeUndefined();
+  });
+
+  it("scopes headers to their methods", () => {
+    const headerRoutes = routes.filter(
+      (r) => r.headers && r.continue && new RegExp(r.src!).test("/hdr/a")
+    );
+    expect(headerRoutes).toEqual([
+      expect.objectContaining({ headers: { "x-hdr": "1" } }),
+      expect.objectContaining({ headers: { "x-get": "1" }, methods: ["GET", "HEAD"] }),
+    ]);
+    expect(headerRoutes[0]!.methods).toBeUndefined();
+  });
+
+  it("scopes proxies to their methods", () => {
+    expect(matches("/cdn/a", "PUT")[0]).toMatchObject({
+      methods: ["PUT"],
+      dest: "https://example.com/$1",
+    });
+    expect(matches("/cdn/a", "GET")[0]?.dest).toBe("/__server");
+  });
+
+  it("leaves redirects with a method-scoped opt-out to the server function", () => {
+    for (const method of ["GET", "POST"]) {
+      for (const path of ["/m/keep", "/m/other"]) {
+        expect(matches(path, method)[0]?.headers?.Location).toBeUndefined();
+      }
+    }
+  });
+
+  it("keeps opted out paths from a method-scoped redirect", () => {
+    expect(matches("/g/keep", "GET")[0]?.headers?.Location).toBeUndefined();
+    expect(matches("/g/other", "GET")[0]?.headers?.Location).toBe("/x");
+  });
+
+  it("ignores opt-outs for other methods", () => {
+    expect(matches("/p/keep", "POST")[0]?.headers?.Location).toBe("/x");
+    expect(matches("/p/keep", "GET")[0]?.headers?.Location).toBeUndefined();
+  });
+
+  it("matches a HEAD redirect before a GET one", () => {
+    expect(matches("/hg", "HEAD")[0]?.headers?.Location).toBe("/h");
+    expect(matches("/hg", "GET")[0]?.headers?.Location).toBe("/g");
+  });
+});

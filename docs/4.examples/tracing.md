@@ -1,0 +1,144 @@
+---
+category: features
+icon: i-lucide-activity
+---
+
+# Tracing
+
+> Instrument the request lifecycle with diagnostics channels and the built-in tracing logger.
+
+<!-- automd:ui-code-tree src="../../examples/tracing" default="fastnode.config.ts" ignore="README.md,GUIDE.md" expandAll -->
+
+::code-tree{defaultValue="fastnode.config.ts" expandAll}
+
+```ts [fastnode.config.ts]
+import { defineConfig } from "fastnode";
+
+export default defineConfig({
+  serverDir: true,
+
+  // Instrument the h3, srvx, unstorage and db0 tracing channels.
+  tracingChannel: true,
+
+  experimental: {
+    // Log every completed span to the console (built-in, dependency-free sink).
+    tracingLogger: true,
+  },
+});
+```
+
+```json [package.json]
+{
+  "type": "module",
+  "scripts": {
+    "build": "fastnode build",
+    "dev": "fastnode dev",
+    "preview": "node .output/server/index.mjs"
+  },
+  "dependencies": {
+    "unstorage": "^2.0.0-beta.0"
+  },
+  "devDependencies": {
+    "fastnode": "latest",
+    "rolldown": "latest"
+  }
+}
+```
+
+```json [tsconfig.json]
+{
+  "extends": "fastnode/tsconfig"
+}
+```
+
+```ts [server/middleware/timing.ts]
+import { defineMiddleware } from "fastnode";
+
+// A trivial middleware — each request produces its own `middleware` span.
+export default defineMiddleware((event) => {
+  event.context.requestedAt = Date.now();
+});
+```
+
+```ts [server/routes/index.ts]
+import { defineHandler } from "fastnode";
+import { useKV } from "fastnode/kv";
+
+// Reads and writes storage so the request emits `unstorage.*` spans (CLIENT)
+// alongside the `srvx.request`, `middleware` and route (`h3.request`) spans.
+export default defineHandler(async () => {
+  const storage = useKV();
+  const hits = ((await storage.getItem<number>("hits")) ?? 0) + 1;
+  await storage.setItem("hits", hits);
+  return { message: "Hello from the Fastnode tracing demo", hits };
+});
+```
+
+```ts [server/routes/users/[id].ts]
+import { defineHandler } from "fastnode";
+
+// A dynamic route — spans are named by the matched route template
+// (`GET /users/:id`), not the concrete path, to keep cardinality low.
+export default defineHandler((event) => ({
+  user: { id: event.context.params!.id },
+}));
+```
+
+::
+
+<!-- /automd -->
+
+<!-- automd:file src="../../examples/tracing/README.md" -->
+
+Fastnode can instrument its request lifecycle through Node [diagnostics channels](https://nodejs.org/api/diagnostics_channel.html) — no OpenTelemetry SDK required. This example turns instrumentation on and enables the built-in console logger, which groups every h3, srvx, unstorage and db0 span into a per-request timeline (waterfall).
+
+## Enabling tracing
+
+```ts [fastnode.config.ts]
+import { defineConfig } from "fastnode";
+
+export default defineConfig({
+  // Instrument the h3, srvx, unstorage and db0 tracing channels.
+  tracingChannel: true,
+
+  experimental: {
+    // Log every completed span to the console (built-in, dependency-free sink).
+    tracingLogger: true,
+  },
+});
+```
+
+`tracingChannel: true` wires up the producers (it accepts `{ h3, srvx, unstorage, db0 }` to trace a subset). `experimental.tracingLogger` adds a built-in sink that `console.log`s each completed span — a dependency-free alternative to a vendor exporter, handy for local development.
+
+## Try it
+
+```sh
+npm run dev
+# then, in another terminal:
+curl http://localhost:3000/
+curl http://localhost:3000/users/42
+```
+
+Each request prints a timeline of its spans to the console — the middleware, the matched route, and every storage operation, positioned and sized by when they ran and how long they took:
+
+```
+▶ GET /  4.10ms  (4 spans)
+  middleware GET /             █·······················   0.12ms h3.handler_type=middleware http.route=/
+  GET /                        ·███████████████████·····   2.49ms h3.handler_type=route http.route=/
+  getItem                      ···██····················   0.18ms db.operation=getItem db.system=memory unstorage.keys_count=1
+  setItem                      ·····██··················   0.16ms db.operation=setItem db.system=memory unstorage.keys_count=1
+```
+
+The header line (`▶`) is the request itself — its method, path and total time; the rows below are the spans that ran within it. Note the dynamic route is named by its matched template — `GET /users/:id`, not `/users/42` — keeping span names low-cardinality per the OpenTelemetry HTTP conventions.
+
+The request boundary comes from Fastnode's `request`/`response` runtime hooks, so grouping works identically in `vite dev` and in a production build. Spans are grouped per request via async context, so timelines for concurrent requests stay separate, and a failed span is marked `✖` with its error message.
+
+## What gets traced
+
+| Channel | Span | Emitted by |
+| --- | --- | --- |
+| `h3.request` | each matched route and middleware | `server/routes/*`, `server/middleware/*` |
+| `unstorage.*` | each storage operation (`getItem`, `setItem`, …) | `useKV()` in `server/routes/index.ts` |
+| `srvx.request` | the whole request, with response status | the srvx server layer |
+
+<!-- /automd -->

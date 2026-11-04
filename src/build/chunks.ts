@@ -1,0 +1,145 @@
+import type { Fastnode } from "fastnode/types";
+
+// Tests in @test/unit/chunks.test.ts
+
+const virtualRe = /^(?:\0|#|virtual:)/;
+
+export const NODE_MODULES_RE = /node_modules[/\\](?!(?:fastnode|fastnode-nightly)[/\\])[^.]/;
+
+export function libChunkName(id: string) {
+  const pkgName = pathToPkgName(id);
+  return pkgName ? `_libs/${pkgName}` : undefined;
+}
+
+/** Rolldown `codeSplitting` group for library (`node_modules`) chunks. */
+export function libChunksGroup(fastnode: Fastnode) {
+  const group = {
+    test: NODE_MODULES_RE,
+    name: (id: string) => libChunkName(id),
+    // A package's chunk also takes in the packages it imports. Without this, startup code that imports one of them
+    // loads the whole chunk, lazy routes' dependencies included.
+    entriesAware: fastnode.options.experimental.entriesAwareLibChunks !== false,
+  };
+  // Rolldown >= 1.2.10 warns without `debugName`, older versions reject unknown (enumerable) keys
+  Object.defineProperty(group, "debugName", { value: "libs" });
+  return group;
+}
+
+export function pathToPkgName(path: string): string | undefined {
+  let pkgName = path.match(
+    /.*(?:[/\\])node_modules(?:[/\\])(?<name>@[^/\\]+[/\\][^/\\]+|[^/\\.][^/\\]*)/
+  )?.groups?.name;
+  if (pkgName?.endsWith("-nightly")) {
+    pkgName = pkgName.slice(0, -8);
+  }
+  return pkgName;
+}
+
+export function getChunkName(chunk: { name: string; moduleIds: string[] }, fastnode: Fastnode) {
+  // Known groups
+  if (chunk.name === "rolldown-runtime") {
+    return "_runtime.mjs";
+  }
+
+  // `entriesAware` suffixes split lib chunk names with `~<entries>`. Keep the group name, Rolldown dedupes file names
+  if (chunk.name.startsWith("_libs/")) {
+    chunk = { ...chunk, name: chunk.name.split("~")[0]! };
+  }
+
+  // Library chunks
+  if (chunk.moduleIds.every((id) => NODE_MODULES_RE.test(id))) {
+    const chunkName = joinPkgNames(chunk.moduleIds);
+    if (chunkName.length > 30) {
+      return `${chunk.name}+[...].mjs`;
+    }
+    return `_libs/${chunkName || "_"}.mjs`;
+  }
+
+  // _ chunks are preserved (should be after library normalization)
+  if (chunk.name.startsWith("_")) {
+    return `${chunk.name}.mjs`;
+  }
+
+  // No moduleIds
+  if (chunk.moduleIds.length === 0) {
+    return `_chunks/${chunk.name}.mjs`;
+  }
+
+  const ids = chunk.moduleIds.filter((id) => !virtualRe.test(id));
+
+  // All virtual
+  if (ids.length === 0) {
+    if (chunk.moduleIds.every((id) => id.includes("virtual:raw"))) {
+      return `_raw/[name].mjs`;
+    }
+    return `_virtual/[name].mjs`;
+  }
+
+  // WASM chunk
+  if (ids.every((id) => id.endsWith(".wasm"))) {
+    return `_wasm/[name].mjs`;
+  }
+
+  // Chunks generate by other vite environments (we assume SSR for simplicity)
+  if (ids.every((id) => id.includes("vite/services"))) {
+    return `_ssr/[name].mjs`;
+  }
+
+  // Chunks from generated code
+  if (ids.every((id) => id.startsWith(fastnode.options.buildDir))) {
+    return `_build/[name].mjs`;
+  }
+
+  // Try to match user defined routes or tasks
+  const mainId = ids.at(-1);
+  if (mainId) {
+    const routeHandler = fastnode.routing.routes.routes
+      .flatMap((h) => h.data)
+      .find((h) => h.handler === mainId);
+    if (routeHandler?.route) {
+      let routePath = routeToFsPath(routeHandler.route);
+      if (fastnode.options.builder === "rollup") {
+        // rollup treats [name] in chunkFileNames as an invalid placeholder
+        routePath = routePath.replace(/\[/g, "%5B").replace(/\]/g, "%5D");
+      }
+      return `_routes/${routePath}.mjs`;
+    }
+
+    const taskHandler = Object.entries(fastnode.options.tasks).find(
+      ([_, task]) => task.handler === mainId
+    );
+    if (taskHandler) {
+      return `_tasks/[name].mjs`;
+    }
+  }
+
+  return `_chunks/[name].mjs`;
+}
+
+function joinPkgNames(moduleIds: string[]): string {
+  const names = [
+    ...new Set(
+      moduleIds
+        .map((id) => pathToPkgName(id))
+        .filter(Boolean)
+        .map((name) => name!.replace(/^@/, "").replace(/[/\\]/g, "__"))
+    ),
+  ].sort();
+  return names.join("+");
+}
+
+export function routeToFsPath(route: string) {
+  return (
+    route
+      .split("/")
+      .slice(1)
+      .map((s) =>
+        s
+          .replace(/^:(\w+)\(\.\*\)$/, "[...$1]")
+          .replace(/:(\w+)/g, "[$1]")
+          .replace(/\*+/g, "[...]")
+          .replace(/[^a-zA-Z0-9_.[\]]/g, "_")
+      )
+      .join("/") || "index"
+  );
+}

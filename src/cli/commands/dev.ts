@@ -1,7 +1,7 @@
 import type { Fastnode, FastnodeConfig } from "fastnode/types";
 import { defineCommand } from "citty";
 import { consola } from "consola";
-import { info } from "../ui.ts";
+import { error, info, startSpinner, stopSpinner } from "../ui.ts";
 import { build, createFastnode, prepare } from "fastnode/builder";
 import { resolve } from "pathe";
 import { commonArgs } from "../common.ts";
@@ -94,8 +94,12 @@ export async function runDev(opts: {
       port: opts.port || fastnode.options.devServer.port,
       hostname: opts.host || fastnode.options.devServer.hostname,
     });
+    const spin1 = startSpinner("Preparing app...");
     await prepare(fastnode);
+    stopSpinner(spin1, "App prepared.");
+    const spin2 = startSpinner("Building app...");
     await build(fastnode);
+    stopSpinner(spin2, "App built.");
   };
   await reload();
 }

@@ -8,7 +8,19 @@ import { installDependencies, installDependenciesCommand, runScriptCommand } fro
 import type { PackageManagerName } from "nypm";
 import { join, resolve } from "pathe";
 import { hasTTY, isAgent } from "std-env";
-import { error, info, log, start, success, warn } from "../../ui.ts";
+import {
+  error,
+  info,
+  log,
+  panel,
+  startSpinner,
+  stopSpinner,
+  success,
+  warn,
+  promptText,
+  promptSelect,
+  promptConfirm,
+} from "../../ui.ts";
 import { showUsage } from "../../_usage.ts";
 import { findArgsError } from "./_args.ts";
 import { createProject, isEmptyDir, projectTemplates } from "./_project.ts";
@@ -94,14 +106,11 @@ export default defineCommand({
     let dir = resolve(
       args.dir ||
         (interactive
-          ? await consola
-              .prompt("Where would you like to create your Fastnode project?", {
-                type: "text",
-                placeholder: `./${DEFAULT_DIR}`,
-                default: DEFAULT_DIR,
-                cancel: "reject",
-              })
-              .catch(() => process.exit(1))
+          ? ((await promptText({
+              message: "Where would you like to create your Fastnode project?",
+              placeholder: `./${DEFAULT_DIR}`,
+              defaultValue: DEFAULT_DIR,
+            })) ?? DEFAULT_DIR)
           : DEFAULT_DIR)
     );
 
@@ -115,28 +124,24 @@ export default defineCommand({
       );
     }
     while (!force && !(await isEmptyDir(dir))) {
-      const action = await consola
-        .prompt(
-          `Directory ${colors.cyan(displayPath(dir))} is not empty. What would you like to do?`,
-          {
-            type: "select",
-            options: [
-              { label: "Select a different directory", value: "new-directory" },
-              { label: "Override its contents", value: "override" },
-              { label: "Abort", value: "abort" },
-            ],
-            cancel: "reject",
-          }
-        )
-        .catch(() => process.exit(1));
+      const action = await promptSelect({
+        message: `Directory ${colors.cyan(displayPath(dir))} is not empty. What would you like to do?`,
+        options: [
+          { label: "Select a different directory", value: "new-directory" },
+          { label: "Override its contents", value: "override" },
+          { label: "Abort", value: "abort" },
+        ],
+      });
       if (action === "override") {
         force = true;
       } else if (action === "new-directory") {
-        dir = resolve(
-          await consola
-            .prompt("Please specify a different directory:", { type: "text", cancel: "reject" })
-            .catch(() => process.exit(1))
-        );
+        const newDir = await promptText({
+          message: "Please specify a different directory:",
+        });
+        if (newDir === null) {
+          process.exit(1);
+        }
+        dir = resolve(newDir);
       } else {
         process.exit(1);
       }
@@ -145,16 +150,13 @@ export default defineCommand({
     const template =
       args.template ||
       (interactive
-        ? await consola
-            .prompt("Which builder would you like to use?", {
-              type: "select",
-              options: projectTemplates.map((t) => ({
-                label: `${t.title} ${colors.dim(`(${t.description})`)}`,
-                value: t.name,
-              })),
-              cancel: "reject",
-            })
-            .catch(() => process.exit(1))
+        ? ((await promptSelect({
+            message: "Which builder would you like to use?",
+            options: projectTemplates.map((t) => ({
+              label: `${t.title} ${colors.dim(`(${t.description})`)}`,
+              value: t.name,
+            })),
+          })) ?? templateNames[0]!)
         : templateNames[0]!);
 
     const { overwritten } = await createProject(dir, { template, force });
@@ -167,25 +169,23 @@ export default defineCommand({
     }
 
     const detectedPM = detectPackageManager();
-    let packageManager: PackageManagerName | undefined;
+    let packageManager: PackageManagerName | "" | undefined;
     let pmSource = "selected";
     if (args.packageManager) {
       packageManager = args.packageManager as PackageManagerName;
     } else if (args.install && interactive) {
-      packageManager =
-        ((await consola.prompt("Which package manager would you like to use?", {
-          type: "select",
-          initial: detectedPM,
-          options: [
-            { label: "(none)", value: "", hint: "skip installing dependencies" },
-            ...pmNames.map((pm) => ({
-              label: pm,
-              value: pm,
-              hint: pm === detectedPM ? "current" : undefined,
-            })),
-          ],
-          cancel: "undefined",
-        })) as PackageManagerName | "" | undefined) || undefined;
+      const selected = await promptSelect({
+        message: "Which package manager would you like to use?",
+        options: [
+          { label: "(none)", value: "", hint: "skip installing dependencies" },
+          ...pmNames.map((pm) => ({
+            label: pm,
+            value: pm,
+            hint: pm === detectedPM ? "current" : undefined,
+          })),
+        ],
+      });
+      packageManager = (selected as PackageManagerName | "") ?? "";
     } else {
       packageManager = detectedPM || "npm";
       pmSource = detectedPM ? "detected" : "default";
@@ -194,12 +194,13 @@ export default defineCommand({
     let installed = false;
     let pm = packageManager || "npm";
     if (args.install && packageManager) {
-      start(`Installing dependencies with \`${packageManager}\`...`);
+      const spin = startSpinner(`Installing dependencies with \`${packageManager}\`...`);
       try {
         await installDependencies({ cwd: dir, packageManager });
         installed = true;
-        success("Dependencies installed.");
+        stopSpinner(spin, "Dependencies installed.");
       } catch (err) {
+        stopSpinner(spin);
         process.exitCode = 1;
         const notFound = isNotFoundError(err);
         if (notFound && packageManager !== "npm") {
@@ -220,11 +221,11 @@ export default defineCommand({
       !hasGit &&
       (args.gitInit ??
         (interactive &&
-          (await consola.prompt("Initialize a git repository?", {
-            type: "confirm",
-            initial: !insideRepo,
-            cancel: "undefined",
-          }))));
+          (await (promptConfirm({
+            message: "Initialize a git repository?",
+            active: "Yes",
+            inactive: "No",
+          }) ?? Promise.resolve(!insideRepo)))));
     let gitInitialized = false;
     if (hasGit && args.gitInit) {
       info("Skipped `git init`: the directory is already a git repository.");
@@ -273,17 +274,18 @@ export default defineCommand({
       runScriptCommand(pm, "dev"),
     ].filter(Boolean) as string[];
 
-    log(
-      `\nSummary:\n${summary.map(([label, value]) => `  ${`${label}:`.padEnd(17)} ${value}`).join("\n")}`
+    panel(
+      "Summary",
+      summary.map(([label, value]) => `${label.padEnd(17)} ${value}`)
     );
     const agentHint = isAgent
       ? "\n\nAgents: read AGENTS.md, and test routes with `npx fastnode fetch /api/hello` (no build or running server needed)."
       : "";
     const nextStepsText = `Next steps:\n\n${nextSteps.map((step) => `  ${step}`).join("\n")}${agentHint}\n\nFastnode v1 docs: https://fastnode.khulnasoft.com/docs`;
     if (interactive) {
-      consola.box(nextStepsText);
+      panel("Next steps", [nextStepsText]);
     } else {
-      consola.log(`\n${nextStepsText}\n`);
+      log(`\n${nextStepsText}\n`);
     }
   },
 });

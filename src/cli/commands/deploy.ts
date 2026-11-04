@@ -1,7 +1,7 @@
 import { defineCommand } from "citty";
 import type { DateString } from "compatx";
 import { resolve } from "pathe";
-import { error, warn } from "../ui.ts";
+import { error, info, startSpinner, stopSpinner, success, warn } from "../ui.ts";
 import {
   build,
   copyPublicAssets,
@@ -73,15 +73,28 @@ export default defineCommand({
 
     try {
       if (!args.prebuilt) {
+        const spin1 = startSpinner("Preparing app...");
         await prepare(fastnode);
-        // The vite builder copies public assets and prerenders after building the client
+        stopSpinner(spin1, "App prepared.");
+
         if (fastnode.options.builder !== "vite") {
+          const spin2 = startSpinner("Copying public assets...");
           await copyPublicAssets(fastnode);
+          stopSpinner(spin2, "Public assets copied.");
+
+          const spin3 = startSpinner("Prerendering...");
           await prerender(fastnode);
+          stopSpinner(spin3, "Prerendering complete.");
         }
+
+        const spin4 = startSpinner("Building app...");
         await build(fastnode);
+        stopSpinner(spin4, "App built.");
       }
+
+      const spin5 = startSpinner("Deploying...");
       await deploy(fastnode, { args: extraArgs });
+      stopSpinner(spin5, "Deployed.");
     } catch (err) {
       error((err as Error).message);
       process.exitCode = 1;

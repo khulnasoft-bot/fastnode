@@ -48,7 +48,7 @@ export default defineCommand({
       },
       onClose(cause) {
         if (started && !closing) {
-          error("Server exited unexpectedly.", cause ?? "");
+          error("Server exited unexpectedly.");
           process.exit(1);
         }
       },

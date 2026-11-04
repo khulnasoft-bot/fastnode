@@ -46,7 +46,7 @@ export default defineCommand({
           buildDir: options?.buildDir || ".fastnode",
         }
       );
-      success("Result:", result);
+      success(`Result: ${JSON.stringify(result)}`);
     } catch (err) {
       error(`Failed to run task \`${args.name}\`: ${err}`);
       process.exit(1); // eslint-disable-line unicorn/no-process-exit

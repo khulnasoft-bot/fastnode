@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 import { defineCommand, runMain } from "citty";
 import { version as fastnodeVersion } from "#fastnode/meta";
-import { intro, outro } from "./ui.ts";
+import { error, intro, log, outro, success } from "./ui.ts";
 
 const pkgName = "fastnode";
 const pkgVersion = fastnodeVersion ?? "1.0.0";
 
-intro(`${pkgName} v${pkgVersion}`);
+// Only show intro when not requesting help/version
+const isHelpRequest = process.argv.includes("--help") || process.argv.includes("-h");
+const isVersionRequest = process.argv.includes("--version") || process.argv.includes("-v");
+
+if (!isHelpRequest && !isVersionRequest) {
+  intro(`${pkgName} v${pkgVersion}`);
+}
 
 const main = defineCommand({
   meta: {
@@ -29,6 +35,13 @@ const main = defineCommand({
   },
 });
 
-runMain(main).finally(() => {
-  outro(`Happy coding with ${pkgName}!`);
-});
+runMain(main)
+  .catch((err) => {
+    error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    if (!isHelpRequest && !isVersionRequest) {
+      outro(`Happy coding with ${pkgName}!`);
+    }
+  });

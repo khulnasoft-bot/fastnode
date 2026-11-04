@@ -3,6 +3,7 @@ import type { DateString } from "compatx";
 import { build, copyPublicAssets, createFastnode, prepare, prerender } from "fastnode/builder";
 import { resolve } from "pathe";
 import { commonArgs } from "../common.ts";
+import { error, info, startSpinner, stopSpinner, success } from "../ui.ts";
 
 export const buildArgs = {
   ...commonArgs,
@@ -53,13 +54,26 @@ export default defineCommand({
         c12: { envName: args.envName },
       }
     );
+    const spin1 = startSpinner("Preparing app...");
     await prepare(fastnode);
+    stopSpinner(spin1, "App prepared.");
+
     // The vite builder copies public assets and prerenders after building the client
     if (fastnode.options.builder !== "vite") {
+      const spin2 = startSpinner("Copying public assets...");
       await copyPublicAssets(fastnode);
+      stopSpinner(spin2, "Public assets copied.");
+
+      const spin3 = startSpinner("Prerendering...");
       await prerender(fastnode);
+      stopSpinner(spin3, "Prerendering complete.");
     }
+
+    const spin4 = startSpinner("Building app...");
     await build(fastnode);
+    stopSpinner(spin4, "App built.");
+
     await fastnode.close();
+    success("Build complete.");
   },
 });

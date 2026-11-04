@@ -11,6 +11,13 @@ import type { SpinnerResult } from "@clack/prompts";
 
 const useClack = hasTTY && clackIsTTY(process.stdout);
 
+function formatMessage(message: string, ...args: any[]): string {
+  if (args.length === 0) {
+    return message;
+  }
+  return message + " " + args.map((a) => String(a)).join(" ");
+}
+
 export function intro(message: string): void {
   if (useClack) {
     clackIntro(message);
@@ -27,43 +34,53 @@ export function outro(message: string): void {
   }
 }
 
-export function log(message: string): void {
+export function log(message: string, ...args: any[]): void {
   if (useClack) {
-    clackLog.message(message);
+    clackLog.message(formatMessage(message, ...args));
   } else {
-    consola.log(message);
+    consola.log(formatMessage(message, ...args));
   }
 }
 
-export function info(message: string): void {
+export function info(message: string, ...args: any[]): void {
   if (useClack) {
-    clackLog.info(message);
+    clackLog.info(formatMessage(message, ...args));
   } else {
-    consola.info(message);
+    consola.info(formatMessage(message, ...args));
   }
 }
 
-export function warn(message: string): void {
+export function warn(message: string, ...args: any[]): void {
   if (useClack) {
-    clackLog.warn(message);
+    clackLog.warn(formatMessage(message, ...args));
   } else {
-    consola.warn(message);
+    consola.warn(formatMessage(message, ...args));
   }
 }
 
-export function error(message: string): void {
+export function error(message: string, ...args: any[]): void {
   if (useClack) {
-    clackLog.error(message);
+    clackLog.error(formatMessage(message, ...args));
   } else {
-    consola.error(message);
+    consola.error(formatMessage(message, ...args));
   }
 }
 
-export function success(message: string): void {
+export function success(message: string, ...args: any[]): void {
   if (useClack) {
-    clackLog.success(message);
+    clackLog.success(formatMessage(message, ...args));
   } else {
-    consola.success(message);
+    consola.success(formatMessage(message, ...args));
+  }
+}
+
+export function start(message: string): void {
+  if (useClack) {
+    const spin = clackSpinner({});
+    spin.start(message);
+    // Don't return - fire and forget for non-TTY fallback compatibility
+  } else {
+    consola.start(message);
   }
 }
 

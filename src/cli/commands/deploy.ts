@@ -1,7 +1,7 @@
 import { defineCommand } from "citty";
 import type { DateString } from "compatx";
 import { resolve } from "pathe";
-import consola from "consola";
+import { error, warn } from "../ui.ts";
 import {
   build,
   copyPublicAssets,
@@ -34,18 +34,18 @@ export default defineCommand({
     if (args.prebuilt) {
       const lastBuild = await getBuildInfo({ rootDir });
       if (!lastBuild.buildInfo) {
-        consola.error("No build info found, cannot deploy.");
+        error("No build info found, cannot deploy.");
         process.exit(1);
       }
       if (preset && preset !== lastBuild.buildInfo.preset) {
-        consola.warn(
+        warn(
           `Ignoring \`--preset ${preset}\` and using \`${lastBuild.buildInfo.preset}\` from the existing build.`
         );
       }
       preset = lastBuild.buildInfo.preset;
       if (lastBuild.buildInfo.envName) {
         if (envName && envName !== lastBuild.buildInfo.envName) {
-          consola.warn(
+          warn(
             `Ignoring \`--envName ${envName}\` and using \`${lastBuild.buildInfo.envName}\` from the existing build.`
           );
         }
@@ -82,8 +82,8 @@ export default defineCommand({
         await build(fastnode);
       }
       await deploy(fastnode, { args: extraArgs });
-    } catch (error) {
-      consola.error(error);
+    } catch (err) {
+      error((err as Error).message);
       process.exitCode = 1;
     } finally {
       await fastnode.close();

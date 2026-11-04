@@ -5,6 +5,7 @@ import { finished, pipeline } from "node:stream/promises";
 import { defineCommand } from "citty";
 import { LogLevels, consola } from "consola";
 import { resolve } from "pathe";
+import { error, info } from "../../ui.ts";
 import { startUnbundledServer } from "../../../build/builders/unbundled/serve.ts";
 import { fetchDevServer, findDevServer } from "./_dev.ts";
 import { type FetchOptions, createFetchRequest, fetchArgs, parseFetchArgs } from "./_request.ts";
@@ -25,8 +26,8 @@ export default defineCommand({
         consola.level = LogLevels.silent;
       }
       request = await createFetchRequest(opts);
-    } catch (error) {
-      consola.error((error as Error).message);
+    } catch (err) {
+      error((err as Error).message);
       process.exit(2);
     }
 
@@ -48,7 +49,7 @@ export default defineCommand({
       opts.dev === false ? undefined : await findDevServer(rootDir, { envName: opts.envName });
     consola.level = opts.silent ? LogLevels.silent : 3;
     if (dev) {
-      consola.info(`Using the running dev server at \`${dev.url}\` (pid: ${dev.pid})`);
+      info(`Using the running dev server at \`${dev.url}\` (pid: ${dev.pid})`);
     }
     consola.level = opts.silent ? LogLevels.silent : opts.verbose ? 3 : 1;
 
@@ -98,21 +99,21 @@ export default defineCommand({
       if (res.status >= 400) {
         exitCode = 22;
         if (!opts.silent) {
-          consola.error(`The requested URL returned error: ${res.status}`);
+          error(`The requested URL returned error: ${res.status}`);
         }
       }
-    } catch (error) {
+    } catch (err) {
       if (abort.signal.aborted) {
         // Interrupted
       } else if (outputError) {
         // Like curl, also when stdout is closed early (`fastnode fetch | head`)
         exitCode = 23;
         if (!opts.silent && (outputError as NodeJS.ErrnoException).code !== "EPIPE") {
-          consola.error(`Failed writing the output: ${outputError.message}`);
+          error(`Failed writing the output: ${outputError.message}`);
         }
       } else {
         exitCode = 1;
-        consola.error(error);
+        error((err as Error).message);
       }
     }
 

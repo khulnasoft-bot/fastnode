@@ -1,8 +1,8 @@
 import { defineCommand } from "citty";
-import { consola } from "consola";
 import destr from "destr";
 import { loadOptions, runTask } from "fastnode/builder";
 import { resolve } from "pathe";
+import { error, info, success } from "../../ui.ts";
 
 export default defineCommand({
   meta: {
@@ -28,10 +28,10 @@ export default defineCommand({
     const cwd = resolve((args.dir || args.cwd || ".") as string);
     const options = await loadOptions({ rootDir: cwd }).catch(() => undefined);
 
-    consola.info(`Running task \`${args.name}\`...`);
+    info(`Running task \`${args.name}\`...`);
     let payload: any = destr(args.payload || "{}");
     if (typeof payload !== "object") {
-      consola.error(`Invalid payload: \`${args.payload}\` (it should be a valid JSON object)`);
+      error(`Invalid payload: \`${args.payload}\` (it should be a valid JSON object)`);
       payload = undefined;
     }
     try {
@@ -46,9 +46,9 @@ export default defineCommand({
           buildDir: options?.buildDir || ".fastnode",
         }
       );
-      consola.success("Result:", result);
-    } catch (error) {
-      consola.error(`Failed to run task \`${args.name}\`: ${error}`);
+      success("Result:", result);
+    } catch (err) {
+      error(`Failed to run task \`${args.name}\`: ${err}`);
       process.exit(1); // eslint-disable-line unicorn/no-process-exit
     }
   },

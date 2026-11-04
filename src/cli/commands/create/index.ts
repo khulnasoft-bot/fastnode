@@ -8,6 +8,7 @@ import { installDependencies, installDependenciesCommand, runScriptCommand } fro
 import type { PackageManagerName } from "nypm";
 import { join, resolve } from "pathe";
 import { hasTTY, isAgent } from "std-env";
+import { error, info, log, start, success, warn } from "../../ui.ts";
 import { showUsage } from "../../_usage.ts";
 import { findArgsError } from "./_args.ts";
 import { createProject, isEmptyDir, projectTemplates } from "./_project.ts";
@@ -158,11 +159,11 @@ export default defineCommand({
 
     const { overwritten } = await createProject(dir, { template, force });
     const dirPath = displayPath(dir);
-    consola.success(
+    success(
       `Created a new Fastnode project in ${dirPath === "." ? "the current directory" : colors.cyan(dirPath)}.`
     );
     if (overwritten.length > 0) {
-      consola.warn(`Overwrote existing files: ${overwritten.join(", ")}.`);
+      warn(`Overwrote existing files: ${overwritten.join(", ")}.`);
     }
 
     const detectedPM = detectPackageManager();
@@ -193,21 +194,21 @@ export default defineCommand({
     let installed = false;
     let pm = packageManager || "npm";
     if (args.install && packageManager) {
-      consola.start(`Installing dependencies with \`${packageManager}\`...`);
+      start(`Installing dependencies with \`${packageManager}\`...`);
       try {
         await installDependencies({ cwd: dir, packageManager });
         installed = true;
-        consola.success("Dependencies installed.");
-      } catch (error) {
+        success("Dependencies installed.");
+      } catch (err) {
         process.exitCode = 1;
-        const notFound = isNotFoundError(error);
+        const notFound = isNotFoundError(err);
         if (notFound && packageManager !== "npm") {
           pm = "npm";
         }
-        consola.error(
-          `Failed to install dependencies: ${notFound ? `\`${packageManager}\` is not installed (or not in PATH).` : (error as Error).message}`
+        error(
+          `Failed to install dependencies: ${notFound ? `\`${packageManager}\` is not installed (or not in PATH).` : (err as Error).message}`
         );
-        consola.info(
+        info(
           `The project files were created: install dependencies in the project directory with an available package manager (see the next steps), rather than running \`fastnode create\` again.`
         );
       }
@@ -226,16 +227,16 @@ export default defineCommand({
           }))));
     let gitInitialized = false;
     if (hasGit && args.gitInit) {
-      consola.info("Skipped `git init`: the directory is already a git repository.");
+      info("Skipped `git init`: the directory is already a git repository.");
     } else if (gitInit) {
       try {
         execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
         gitInitialized = true;
-        consola.success(
+        success(
           `Git repository initialized${insideRepo ? " (nested inside an existing repository or workspace)" : ""}.`
         );
-      } catch (error) {
-        consola.warn(`Failed to initialize a git repository: ${(error as Error).message}`);
+      } catch (err) {
+        warn(`Failed to initialize a git repository: ${(err as Error).message}`);
       }
     }
 
@@ -272,7 +273,7 @@ export default defineCommand({
       runScriptCommand(pm, "dev"),
     ].filter(Boolean) as string[];
 
-    consola.log(
+    log(
       `\nSummary:\n${summary.map(([label, value]) => `  ${`${label}:`.padEnd(17)} ${value}`).join("\n")}`
     );
     const agentHint = isAgent
@@ -288,6 +289,6 @@ export default defineCommand({
 });
 
 function fail(message: string): never {
-  consola.error(message);
+  error(message);
   process.exit(1);
 }

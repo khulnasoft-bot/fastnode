@@ -1,6 +1,7 @@
 import type { Fastnode, FastnodeConfig } from "fastnode/types";
 import { defineCommand } from "citty";
 import { consola } from "consola";
+import { info } from "../ui.ts";
 import { build, createFastnode, prepare } from "fastnode/builder";
 import { resolve } from "pathe";
 import { commonArgs } from "../common.ts";
@@ -51,7 +52,7 @@ export async function runDev(opts: {
   });
   const reload = async () => {
     if (fastnode) {
-      consola.info("Restarting dev server...");
+      info("Restarting dev server...");
       if ("unwatch" in fastnode.options._c12) {
         await fastnode.options._c12.unwatch();
       }
@@ -75,7 +76,7 @@ export async function runDev(opts: {
               return; // No changes
             }
 
-            consola.info(
+            info(
               "Fastnode config updated:\n" + diff.map((entry) => `  ${entry.toString()}`).join("\n")
             );
 

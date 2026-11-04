@@ -1,5 +1,5 @@
 import { defineCommand } from "citty";
-import { consola } from "consola";
+import { log } from "../../ui.ts";
 import { listTasks, loadOptions } from "fastnode/builder";
 import { resolve } from "pathe";
 
@@ -23,7 +23,7 @@ export default defineCommand({
       buildDir: options?.buildDir || ".fastnode",
     });
     for (const [name, task] of Object.entries(tasks)) {
-      consola.log(` - \`${name}\`${task.meta?.description ? ` - ${task.meta.description}` : ""}`);
+      log(` - \`${name}\`${task.meta?.description ? ` - ${task.meta.description}` : ""}`);
     }
   },
 });

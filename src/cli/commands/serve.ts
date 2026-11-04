@@ -1,5 +1,5 @@
 import { defineCommand } from "citty";
-import { consola } from "consola";
+import { error, info } from "../ui.ts";
 import { colors } from "consola/utils";
 import { resolve } from "pathe";
 import { commonArgs } from "../common.ts";
@@ -48,14 +48,14 @@ export default defineCommand({
       },
       onClose(cause) {
         if (started && !closing) {
-          consola.error("Server exited unexpectedly.", cause ?? "");
+          error("Server exited unexpectedly.", cause ?? "");
           process.exit(1);
         }
       },
     });
 
     started = true;
-    consola.info(
+    info(
       `Serving server sources in production mode ${colors.gray("(use --dev to watch for changes)")}`
     );
 

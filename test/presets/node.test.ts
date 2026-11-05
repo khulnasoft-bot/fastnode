@@ -48,7 +48,7 @@ describe("fastnode:preset:node-middleware", async () => {
     const serverNodeModules = resolve(ctx.outDir, "server/node_modules");
     expect(existsSync(resolve(serverNodeModules, "@fixture/fastnode-utils/extra.mjs"))).toBe(true);
     // required from a bundled CommonJS package (https://github.com/khulnasoft/fastnode/issues/4093)
-    expect(existsSync(resolve(serverNodeModules, "@fixture/fastnode-native-mock/index.js"))).toBe(
+    expect(existsSync(resolve(serverNodeModules, "@fixture/fastnode-native-mock/index.mjs"))).toBe(
       true
     );
   });

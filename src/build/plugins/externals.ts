@@ -115,14 +115,32 @@ export function externals(opts: ExternalsOptions): Plugin {
           resolved = cjsResolved; /* non-wrapped */
         }
 
-        // Unresolved bare import of a package matching the trace include-pattern.
-        // Native/non-bundleable deps (e.g. `sharp`) are often imported from a
-        // generated entry outside the declaring package's resolution scope, and
-        // under pnpm the nested dep is not resolvable from there. It is force-
-        // copied into the output by the trace (`traceInclude`/`traceIncludeRoots`),
-        // so externalize it by name instead of letting the bundler fail to resolve.
+        // Unresolved bare import (e.g. a bare package specifier that no other
+        // resolver could resolve). In dev mode (`trace: false`) there is no
+        // node-resolve plugin in the rollup chain, so bare specifiers stay
+        // unresolved and become bare imports in the output. The build output
+        // may run from `buildDir` (e.g. `/tmp` or inside `node_modules/.fastnode`)
+        // from which `rootDir`'s `node_modules` is not reachable via bare
+        // specifier resolution, so resolve them from `rootDir` and externalize
+        // to absolute file URLs.
         if (!resolved?.id) {
-          const importId = opts.trace ? toImport(id) : undefined;
+          const importId = toImport(id);
+          if (importId && !opts.trace) {
+            const resolvedPath = tryResolve(importId, importer);
+            if (resolvedPath) {
+              const resolvedId = isAbsolute(resolvedPath)
+                ? pathToFileURL(resolvedPath).href
+                : resolvedPath;
+              if (!filter(resolvedId)) {
+                return { id: resolvedId };
+              }
+              return {
+                resolvedBy: PLUGIN_NAME,
+                external: true,
+                id: resolvedId,
+              };
+            }
+          }
           if (importId && include?.some((r) => r.test(importId))) {
             // Observed but unresolvable native import: force-trace it by name.
             // nf3 matches `traceInclude` entries against bare dependency names,
